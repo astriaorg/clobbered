@@ -107,11 +107,11 @@ impl Level {
 
         'match_loop: while let Some(mut maker) = self.inner.pop_front() {
             if taker.quantity() > maker.quantity() {
-                quantity = taker.quantity().saturating_sub(maker.quantity());
+                quantity = *maker.quantity();
                 taker.quantity = taker.quantity().saturating_sub(&quantity);
                 maker.quantity = order::Quantity::zero();
             } else {
-                quantity = maker.quantity().saturating_sub(maker.quantity());
+                quantity = *taker.quantity();
                 maker.quantity = maker.quantity().saturating_sub(&quantity);
                 taker.quantity = order::Quantity::zero();
             }
@@ -266,12 +266,19 @@ where
     ///
     /// Returns the order if it was present in the halfbook.
     fn cancel(&mut self, id: &order::Id) -> Option<order::Order> {
-        let price = self.id_to_position.get(id)?;
+        let price = self.id_to_position.remove(id)?;
         let level = self
             .levels
-            .get_mut(price)
+            .get_mut(&price)
             .expect("invariant violated: an entry in id_to_position must map to a level");
-        level.remove_order(id)
+        let order = level.remove_order(id);
+        
+        // Clean up empty levels
+        if level.inner.is_empty() {
+            self.levels.remove(&price);
+        }
+        
+        order
     }
 
     /// Returns if ID is known by the halfbook.
@@ -486,7 +493,7 @@ impl Book {
         // one to check if a full execution would be possible, and then to do the execution),
         // or alternatively a roll-back mechanism that undoes the transaction.
         if order.needs_full_execution()
-            && self.has_enough_volume_on_side_at_price_or_better(
+            && !self.has_enough_volume_on_side_at_price_or_better(
                 &order.side().opposite(),
                 &order.price,
                 &order.quantity,
@@ -502,17 +509,32 @@ impl Book {
         'level_loop: for (current_price, level) in
             self.iter_best_prices_mut(&order.side().opposite())
         {
-            if order.is_filled()
-                || current_price.is_better_than_or_equal_to(order.price(), &order.side().opposite())
-            {
+            // For matching: bid can execute against asks at prices <= bid price
+            // ask can execute against bids at prices >= ask price
+            let can_execute = match order.side() {
+                order::Side::Bid => current_price <= order.price(), // ask price <= bid price
+                order::Side::Ask => current_price >= order.price(), // bid price >= ask price
+            };
+            
+            if order.is_filled() || !can_execute {
                 break 'level_loop;
             }
             level.match_order(&mut order, log);
         }
 
         self.drop_empty_levels(&order.side().opposite());
+        
+        // Remove filled orders from tracking maps
+        for event in log.events() {
+            if let transaction::Event::Fill { id, side } = event {
+                match side {
+                    order::Side::Ask => { self.asks.id_to_position.remove(id); },
+                    order::Side::Bid => { self.bids.id_to_position.remove(id); },
+                }
+            }
+        }
 
-        if order.is_immediate() && !order.is_filled() {
+        if !order.is_immediate() && !order.is_filled() {
             log.push(transaction::Event::Added(order.clone()));
             self.add_order_unchecked(order);
         }
@@ -533,10 +555,7 @@ impl Book {
     ///
     /// This function checks if `order.id` exists in the orderbook.
     pub fn contains(&self, order: &order::Order) -> bool {
-        match order.side() {
-            order::Side::Ask => self.asks.contains(order.id()),
-            order::Side::Bid => self.bids.contains(order.id()),
-        }
+        self.asks.contains(order.id()) || self.bids.contains(order.id())
     }
 
     /// Returns if [`order`] crosses the market.
@@ -601,7 +620,7 @@ impl Book {
         }
     }
 
-    fn get_worst_price(&self, side: &order::Side) -> Option<&Price> {
+    pub fn get_worst_price(&self, side: &order::Side) -> Option<&Price> {
         match side {
             order::Side::Ask => self.asks.worst_price(),
             order::Side::Bid => self.bids.worst_price(),
