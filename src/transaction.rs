@@ -23,7 +23,7 @@ impl Log {
 pub enum Event {
     /// An order that was added to the orderbook.
     Added(order::Order),
-    /// An order that has been filled and is subsequently removed from the orderbook.
+    /// An order that has been filled. If the order was in the orderbook it is subsequently removed.
     Fill { id: order::Id, side: order::Side },
     Match {
         /// The ID of the order that triggered a match, i.e. the order that is being filled by

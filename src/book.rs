@@ -13,7 +13,7 @@ pub enum AddOrderError {
         market_side: crate::order::Side,
         requested: crate::order::Quantity,
     },
-    HadNoQuantity(order::Order),
+    PostOnlyWouldCrossMarket(order::Order),
 }
 
 /// A key uniquely identifying an order.
@@ -439,7 +439,7 @@ impl Book {
         }
     }
 
-    /// Returns the price of the [`side`] of the orderbook.
+    /// Returns the best price of the [`side`] of the orderbook.
     ///
     /// That is either the lowest ask price or the highest bid price.
     pub fn best_price(&self, side: &order::Side) -> Option<&Price> {
@@ -450,8 +450,6 @@ impl Book {
     }
 
     /// Adds an incoming order to the order book, triggering a matching process.
-    ///
-    /// Returns an error if an order with the same ID already exists in the orderbook.
     pub fn add_order(
         &mut self,
         mut order: order::Order,
@@ -461,58 +459,60 @@ impl Book {
             return Err(AddOrderError::IdAlreadyExists(order));
         }
 
-        // post-only orders need to short circuit here because no execution (partial or full)
-        // is allowed.
-        //
-        // Other orders that would also not cross the market could in theory also short-circuit here
-        if order.is_post_only() && !order.is_filled() && !self.does_order_cross_market(&order) {
-            log.push(transaction::Event::Added(order.clone()));
-            self.add_order_unchecked(order);
-            return Ok(());
-        }
-
-        if order.is_market() {
-            // Sets the market price to either the worst price on the book (so that
-            // the order will be done against the entire book), or to the best price +/-
-            // slippage if the order contains slippage.
-            self.set_market_order_price(&mut order);
-        }
-
-        // XXX: Right now we don't permit orders in the book that require full execution.
-        // This means that all-or-none and fill-or-kill orders are functionally equivalent.
-        // The reason is that all-or-none orders are a headache both when matching and also
-        // when short circuiting: checking if there is enough liquidity requires a full
-        // execution, whereas actually executing requires either two passes over the data (
-        // one to check if a full execution would be possible, and then to do the execution),
-        // or alternatively a roll-back mechanism that undoes the transaction.
-        if order.needs_full_execution()
-            && self.has_enough_volume_on_side_at_price_or_better(
-                &order.side().opposite(),
-                &order.price,
-                &order.quantity,
-            )
-        {
-            return Err(AddOrderError::InsufficientLiquidity {
-                taker_side: *order.side(),
-                market_side: order.side().opposite(),
-                requested: *order.quantity(),
-            });
-        }
-
-        'level_loop: for (current_price, level) in
-            self.iter_best_prices_mut(&order.side().opposite())
-        {
-            if order.is_filled()
-                || current_price.is_better_than_or_equal_to(order.price(), &order.side().opposite())
-            {
-                break 'level_loop;
+        if order.is_post_only() {
+            if self.does_order_cross_market(&order) {
+                return Err(AddOrderError::PostOnlyWouldCrossMarket(order));
             }
-            level.match_order(&mut order, log);
+        } else {
+            if order.is_market() {
+                // Sets the market price to either the worst price on the book (so that
+                // the order will be done against the entire book), or to the best price +/-
+                // slippage if the order contains slippage.
+                self.set_market_order_price(&mut order);
+            }
+
+            // XXX: Right now we don't permit orders in the book that require full execution.
+            // This means that all-or-none and fill-or-kill orders are functionally equivalent.
+            // The reason is that all-or-none orders are a headache both when matching and also
+            // when short circuiting: checking if there is enough liquidity requires a full
+            // execution, whereas actually executing requires either two passes over the data (
+            // one to check if a full execution would be possible, and then to do the execution),
+            // or alternatively a roll-back mechanism that undoes the transaction.
+            if order.needs_full_execution()
+                && !self.has_enough_volume_on_side_at_price_or_better(
+                    &order.side().opposite(),
+                    &order.price,
+                    &order.quantity,
+                )
+            {
+                return Err(AddOrderError::InsufficientLiquidity {
+                    taker_side: *order.side(),
+                    market_side: order.side().opposite(),
+                    requested: *order.quantity(),
+                });
+            }
+
+            'level_loop: for (current_price, level) in
+                self.iter_best_prices_mut(&order.side().opposite())
+            {
+                if order.is_filled()
+                    || current_price
+                        .is_better_than_or_equal_to(order.price(), &order.side().opposite())
+                {
+                    break 'level_loop;
+                }
+                level.match_order(&mut order, log);
+            }
+
+            self.drop_empty_levels(&order.side().opposite());
         }
 
-        self.drop_empty_levels(&order.side().opposite());
-
-        if order.is_immediate() && !order.is_filled() {
+        if order.is_filled() {
+            log.push(transaction::Event::Fill {
+                id: *order.id(),
+                side: *order.side(),
+            });
+        } else if !order.is_immediate() {
             log.push(transaction::Event::Added(order.clone()));
             self.add_order_unchecked(order);
         }

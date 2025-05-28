@@ -247,11 +247,12 @@ impl Order {
         self.side.is_ask()
     }
 
-    /// Returnus if the order is on the bid-side.
+    /// Returns if the order is on the bid-side.
     pub fn is_bid(&self) -> bool {
         self.side.is_bid()
     }
 
+    /// Returns if the order is filled, i.e. if its quantity is zero.
     pub fn is_filled(&self) -> bool {
         self.quantity.is_zero()
     }
