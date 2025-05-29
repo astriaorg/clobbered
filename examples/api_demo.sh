@@ -48,6 +48,10 @@ echo "5. Get order book state after adding orders:"
 curl -s "$BASE_URL/orderbook" | jq '.'
 
 echo
+echo "5b. Get all orders in the book:"
+curl -s "$BASE_URL/orderbook/orders" | jq '.'
+
+echo
 echo "6. Create a market buy order (buy 30 shares at market price):"
 MARKET_RESPONSE=$(curl -s -X POST "$BASE_URL/orders" \
   -H "Content-Type: application/json" \
@@ -61,6 +65,10 @@ echo "$MARKET_RESPONSE" | jq '.'
 echo
 echo "7. Get order book state after market order:"
 curl -s "$BASE_URL/orderbook" | jq '.'
+
+echo
+echo "7b. Get all remaining orders after market order:"
+curl -s "$BASE_URL/orderbook/orders" | jq '.'
 
 echo
 echo "8. Cancel the bid order:"

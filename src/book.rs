@@ -98,6 +98,11 @@ impl Level {
             }))
     }
 
+    /// Returns all orders at this level.
+    pub fn orders(&self) -> Vec<&order::Order> {
+        self.inner.iter().collect()
+    }
+
     /// Matches a taker [`order`] to the orders at this price level.
     ///
     /// Returns a transaction log of the executions performed.
@@ -313,6 +318,14 @@ where
             .last_key_value()
             .map(|(price, _)| price.as_ref())
     }
+
+    /// Returns all orders in the halfbook, organized by price level.
+    fn all_orders(&self) -> Vec<(Price, Vec<&order::Order>)> {
+        self.levels
+            .iter()
+            .map(|(price, level)| (*price.as_ref(), level.orders()))
+            .collect()
+    }
 }
 
 impl<TPrice> Half<TPrice>
@@ -455,6 +468,11 @@ impl Book {
             order::Side::Ask => self.asks.best_price(),
             order::Side::Bid => self.bids.best_price(),
         }
+    }
+
+    /// Returns all orders in the orderbook, organized by side and price level.
+    pub fn all_orders(&self) -> (Vec<(Price, Vec<&order::Order>)>, Vec<(Price, Vec<&order::Order>)>) {
+        (self.bids.all_orders(), self.asks.all_orders())
     }
 
     /// Adds an incoming order to the order book, triggering a matching process.

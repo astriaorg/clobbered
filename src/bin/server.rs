@@ -38,6 +38,18 @@ struct OrderBookState {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct PriceLevel {
+    price: Price,
+    orders: Vec<Order>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OrderBookOrders {
+    bids: Vec<PriceLevel>,
+    asks: Vec<PriceLevel>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -68,6 +80,37 @@ async fn get_orderbook_state(
     let response = OrderBookState {
         best_bid: engine.best_price(&Side::Bid).copied(),
         best_ask: engine.best_price(&Side::Ask).copied(),
+    };
+    
+    Ok(ResponseJson(response))
+}
+
+async fn get_orderbook_orders(
+    State(state): State<Arc<AppState>>,
+) -> Result<ResponseJson<OrderBookOrders>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let engine = state.engine.lock().unwrap();
+    
+    let (bids, asks) = engine.all_orders();
+    
+    let bid_levels: Vec<PriceLevel> = bids
+        .into_iter()
+        .map(|(price, orders)| PriceLevel {
+            price,
+            orders: orders.into_iter().cloned().collect(),
+        })
+        .collect();
+    
+    let ask_levels: Vec<PriceLevel> = asks
+        .into_iter()
+        .map(|(price, orders)| PriceLevel {
+            price,
+            orders: orders.into_iter().cloned().collect(),
+        })
+        .collect();
+    
+    let response = OrderBookOrders {
+        bids: bid_levels,
+        asks: ask_levels,
     };
     
     Ok(ResponseJson(response))
@@ -202,6 +245,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/orderbook", get(get_orderbook_state))
+        .route("/orderbook/orders", get(get_orderbook_orders))
         .route("/orders", post(create_order))
         .route("/orders/:side/:order_id", delete(cancel_order))
         .route("/orders/:order_id", get(check_order))
@@ -215,7 +259,8 @@ async fn main() {
     println!("🚀 Order Book API server running on http://127.0.0.1:3000");
     println!("📚 Available endpoints:");
     println!("  GET  /health                    - Health check");
-    println!("  GET  /orderbook                 - Get order book state");
+    println!("  GET  /orderbook                 - Get order book state (best bid/ask)");
+    println!("  GET  /orderbook/orders          - Get all orders in the book");
     println!("  POST /orders                    - Create a new order");
     println!("  GET  /orders/:order_id          - Check if order exists");
     println!("  DELETE /orders/:side/:order_id  - Cancel an order");

@@ -42,6 +42,10 @@ impl MatchEngine {
     pub fn contains_order(&self, order: &order::Order) -> bool {
         self.the_order_book.contains(order)
     }
+    
+    pub fn all_orders(&self) -> (Vec<(order::Price, Vec<&order::Order>)>, Vec<(order::Price, Vec<&order::Order>)>) {
+        self.the_order_book.all_orders()
+    }
 }
 
 impl Default for MatchEngine {
