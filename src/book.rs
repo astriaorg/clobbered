@@ -5,7 +5,7 @@ use crate::{
     transaction,
 };
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AddOrderError {
     IdAlreadyExists(order::Order),
     InsufficientLiquidity {
@@ -20,6 +20,7 @@ pub enum AddOrderError {
 ///
 /// Contains its order ID, whether it's buy or sell side,
 /// and its symbol.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Key {
     pub side: order::Side,
     pub id: order::Id,

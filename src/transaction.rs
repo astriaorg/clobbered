@@ -1,6 +1,7 @@
 use crate::order;
 
 /// The sequence of transactions that was done to match an order.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Log {
     order_id: order::Id,
     events: Vec<Event>,
@@ -31,7 +32,7 @@ impl Log {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Event {
     /// An order that was added to the orderbook.
     Added(order::Order),
