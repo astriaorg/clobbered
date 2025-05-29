@@ -1,8 +1,18 @@
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Id(uuid::Uuid);
 
+impl Id {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+    
+    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
 /// A non-negative price of an asset.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct Price(u128);
 
@@ -25,9 +35,10 @@ impl Price {
     ///
     /// # Examples
     /// ```
+    /// use clobbered::order::{Price, Slippage};
     /// let price = Price::new(10);
     /// assert_eq!(price.minus_slippage(&Slippage::new(5)), Price::new(5));
-    /// assert_eq!(price.minus_slippage(&Slippage::new(2)), Price::new(0));
+    /// assert_eq!(price.minus_slippage(&Slippage::new(12)), Price::new(0));
     /// ```
     pub fn minus_slippage(&self, slippage: &Slippage) -> Self {
         Self(self.0.saturating_sub(slippage.0))
@@ -40,6 +51,7 @@ impl Price {
     ///
     /// # Examples
     /// ```
+    /// use clobbered::order::{Price, Side};
     /// let price = Price::new(20);
     /// assert!(price.is_better_than_or_equal_to(&Price::new(30), &Side::Ask));
     /// assert!(!price.is_better_than_or_equal_to(&Price::new(30), &Side::Bid));
@@ -52,22 +64,22 @@ impl Price {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct Slippage(u128);
 
 impl Slippage {
-    fn new(value: u128) -> Self {
+    pub fn new(value: u128) -> Self {
         Self(value)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct Quantity(u128);
 
 impl Quantity {
-    pub(crate) fn new(value: u128) -> Self {
+    pub fn new(value: u128) -> Self {
         Self(value)
     }
 
@@ -98,7 +110,7 @@ impl Quantity {
 pub struct Timestamp(std::time::Instant);
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     Ask = 0,
     Bid = 1,
@@ -118,11 +130,12 @@ impl Side {
     /// # Examples
     ///
     /// ```
+    /// use clobbered::order::Side;
     /// let ask = Side::Ask;
     /// let bid = Side::Bid;
     /// assert_eq!(ask.opposite(), bid);
     /// assert_eq!(bid.opposite(), ask);
-    /// assert_eq!(ask.opposite().opposite(). ask),
+    /// assert_eq!(ask.opposite().opposite(), ask);
     /// ```
     pub fn opposite(&self) -> Side {
         match self {
@@ -145,7 +158,7 @@ impl Side {
 ///   is entered below the current market price.
 /// + `StopLimit` orders combine `Stop` orders with `Limit` orders: once
 ///   the stop price is reached the order is converted into a limit order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Type {
     Market,
@@ -163,7 +176,7 @@ pub enum Type {
 ///   is cancelled otherwise (no partial execution is allowed).
 /// + `AllOrNone`: the order must be executed in its entirety. If it cannot be
 ///   executed in its entirety it will remain active until executed or cancelled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum TimeInForce {
     GoodTillCanceled,
@@ -176,7 +189,7 @@ pub enum TimeInForce {
 }
 
 /// An order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Order {
     /// The ID assigned to the order upon entering the system.
     pub(crate) id: Id,
@@ -215,6 +228,81 @@ pub struct Order {
 }
 
 impl Order {
+    pub fn new_limit(
+        id: Id,
+        side: Side,
+        price: Price,
+        quantity: Quantity,
+    ) -> Self {
+        Self {
+            id,
+            type_: Type::Limit,
+            time_in_force: TimeInForce::GoodTillCanceled,
+            side,
+            quantity,
+            price,
+            stop_price: Price::new(0),
+            slippage: None,
+            post_only: false,
+        }
+    }
+
+    pub fn new_market(
+        id: Id,
+        side: Side,
+        quantity: Quantity,
+    ) -> Self {
+        Self {
+            id,
+            type_: Type::Market,
+            time_in_force: TimeInForce::ImmediateOrCancel,
+            side,
+            quantity,
+            price: Price::new(0), // Will be set during execution
+            stop_price: Price::new(0),
+            slippage: None,
+            post_only: false,
+        }
+    }
+
+    pub fn new_post_only(
+        id: Id,
+        side: Side,
+        price: Price,
+        quantity: Quantity,
+    ) -> Self {
+        Self {
+            id,
+            type_: Type::Limit,
+            time_in_force: TimeInForce::GoodTillCanceled,
+            side,
+            quantity,
+            price,
+            stop_price: Price::new(0),
+            slippage: None,
+            post_only: true,
+        }
+    }
+
+    pub fn new_fill_or_kill(
+        id: Id,
+        side: Side,
+        price: Price,
+        quantity: Quantity,
+    ) -> Self {
+        Self {
+            id,
+            type_: Type::Limit,
+            time_in_force: TimeInForce::FillOrKill,
+            side,
+            quantity,
+            price,
+            stop_price: Price::new(0),
+            slippage: None,
+            post_only: false,
+        }
+    }
+
     pub fn id(&self) -> &Id {
         &self.id
     }

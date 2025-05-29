@@ -30,6 +30,22 @@ impl MatchEngine {
         self.the_order_book.add_order(order, &mut log)?;
         Ok(log)
     }
+    
+    pub fn best_price(&self, side: &order::Side) -> Option<&order::Price> {
+        self.the_order_book.best_price(side)
+    }
+    
+    pub fn cancel_order(&mut self, key: &crate::book::Key) -> Option<order::Order> {
+        self.the_order_book.cancel_order(key)
+    }
+    
+    pub fn contains_order(&self, order: &order::Order) -> bool {
+        self.the_order_book.contains(order)
+    }
+    
+    pub fn all_orders(&self) -> (Vec<(order::Price, Vec<&order::Order>)>, Vec<(order::Price, Vec<&order::Order>)>) {
+        self.the_order_book.all_orders()
+    }
 }
 
 impl Default for MatchEngine {

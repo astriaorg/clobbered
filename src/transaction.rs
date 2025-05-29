@@ -1,12 +1,20 @@
 use crate::order;
 
 /// The sequence of transactions that was done to match an order.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Log {
     order_id: order::Id,
     events: Vec<Event>,
 }
 
 impl Log {
+    pub fn new() -> Self {
+        Self {
+            order_id: order::Id::new(),
+            events: vec![],
+        }
+    }
+
     pub(crate) fn for_order(order: &order::Order) -> Self {
         Self {
             order_id: *order.id(),
@@ -18,8 +26,13 @@ impl Log {
     pub(crate) fn push(&mut self, event: Event) {
         self.events.push(event);
     }
+
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Event {
     /// An order that was added to the orderbook.
     Added(order::Order),
