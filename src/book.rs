@@ -16,18 +16,9 @@ pub enum AddOrderError {
     PostOnlyWouldCrossMarket(order::Order),
 }
 
-/// A key uniquely identifying an order.
-///
-/// Contains its order ID, whether it's buy or sell side,
-/// and its symbol.
-pub struct Key {
-    pub side: order::Side,
-    pub id: order::Id,
-}
-
 /// A price-level of the orderbook.
 #[derive(Debug)]
-pub struct Level {
+struct Level {
     /// The side that this level is on.
     side: order::Side,
     /// The price which this levels applies to.
@@ -58,12 +49,34 @@ impl Level {
         }
     }
 
-    pub fn price(&self) -> &Price {
+    fn price(&self) -> &Price {
         &self.price
     }
 
+    /// Returns if the level has any makers.
+    ///
+    /// This function relies on empty orders being removed from the level.
+    /// If orders with zero quantity are added to the level then this method
+    /// will become meaningless.
     fn has_volume(&self) -> bool {
         !self.inner.is_empty()
+    }
+
+    /// Returns whether [`order`] crosses the level.
+    ///
+    /// The level is crossed if:
+    ///
+    /// + level.side is ask and level.price <= order.price,
+    /// + level.side is bid and level.price >= order.price
+    ///
+    /// This function assumes that [`order`] has the opposite side of the level.
+    /// If it does not then this method is meaningless.
+    fn is_crossed_by_order(&self, order: &order::Order) -> bool {
+        debug_assert_eq!(self.side, order.side.opposite());
+        match &self.side {
+            order::Side::Ask => &self.price <= order.price(),
+            order::Side::Bid => &self.price >= order.price(),
+        }
     }
 
     /// Pushes a new order to the back of the level.
@@ -86,7 +99,7 @@ impl Level {
     /// is used to check if there is enough volume available to fill
     /// an order. Since the order can only request up to [`order::Quantity`]
     /// saturating at its maximum is fine.
-    pub fn calculate_volume(&self) -> order::Quantity {
+    fn calculate_volume(&self) -> order::Quantity {
         let (left, right) = self.inner.as_slices();
         left.iter()
             .fold(order::Quantity::zero(), |acc, order| {
@@ -100,7 +113,7 @@ impl Level {
     /// Matches a taker [`order`] to the orders at this price level.
     ///
     /// Returns a transaction log of the executions performed.
-    pub fn match_order(&mut self, taker: &mut order::Order, log: &mut transaction::Log) {
+    fn match_order(&mut self, taker: &mut order::Order, log: &mut transaction::Log) {
         let price = self.price;
 
         let mut quantity;
@@ -122,10 +135,10 @@ impl Level {
                 quantity,
             });
             if maker.is_filled() {
-                log.push(transaction::Event::Fill {
+                log.push(transaction::Event::MakerFilled(transaction::MakerFilled {
                     id: *maker.id(),
                     side: *maker.side(),
-                })
+                }))
             } else {
                 self.inner.push_front(maker);
             }
@@ -236,12 +249,6 @@ struct Half<TPrice> {
     /// Prices are indices into the map, with the
     /// levels expected to keep a time-ordering.
     levels: BTreeMap<TPrice, Level>,
-
-    /// A map of order ID to its position in the level.
-    ///
-    /// TODO: Use a cheaper hasher. FxHash, rapidhash, GxHash?
-    /// rapidhash contains a nice summary.
-    id_to_position: HashMap<order::Id, TPrice>,
 }
 
 impl<TPrice> Half<TPrice>
@@ -253,7 +260,6 @@ where
         Self {
             side: TPrice::side(),
             levels: BTreeMap::new(),
-            id_to_position: HashMap::new(),
         }
     }
 }
@@ -262,21 +268,22 @@ impl<TPrice> Half<TPrice>
 where
     TPrice: Ord,
 {
-    /// Cancels an order identified by its `id`.
+    /// Cancels an order identified by its `id` and returns it.
     ///
-    /// Returns the order if it was present in the halfbook.
-    fn cancel(&mut self, id: &order::Id) -> Option<order::Order> {
-        let price = self.id_to_position.get(id)?;
+    /// Panics if the halfbook did not contain a level `price` or if
+    /// the price level did not contain the an order with `id`.
+    ///
+    /// This method is supposed to only be called from [`Book`], which
+    /// enforces these invariants.
+    // TODO: Can we use borrow semantics to borrow P as TPrice instead?
+    fn cancel<P: Into<TPrice>>(&mut self, id: &order::Id, price: P) -> order::Order {
         let level = self
             .levels
-            .get_mut(price)
-            .expect("invariant violated: an entry in id_to_position must map to a level");
-        level.remove_order(id)
-    }
-
-    /// Returns if ID is known by the halfbook.
-    fn contains(&self, id: &order::Id) -> bool {
-        self.id_to_position.contains_key(id)
+            .get_mut(&price.into())
+            .expect("invariant violated: `price` passed down from Book must map to a level");
+        level
+            .remove_order(id)
+            .expect("invariant violated: `id` passed down from Book must exist at this level")
     }
 
     fn drop_empty_levels(&mut self) {
@@ -295,6 +302,13 @@ where
         self.levels
             .first_key_value()
             .map(|(price, _)| price.as_ref())
+    }
+
+    // Returns the best price level in the halfbook.
+    //
+    // Depending on how it's parameterized, this is either the lowest ask price or the highest bid price.
+    fn best_price_level(&self) -> Option<&Level> {
+        self.levels.first_key_value().map(|(_, level)| level)
     }
 
     // Returns the best price stored in the halfbook.
@@ -356,11 +370,6 @@ where
     ///
     /// Panics if an order with the same ID already exists in the halfbook.
     fn add_order_unchecked(&mut self, order: order::Order) {
-        assert_eq!(
-            self.id_to_position
-                .insert(*order.id(), TPrice::from(*order.price())),
-            None
-        );
         // TODO: What are reasonable default sizes for the preallocated buffers?
         let level = self
             .levels
@@ -395,13 +404,13 @@ where
 ///    the public interface.
 /// 2. to keep the `AskPrice` and `BidPrice` out of the public interface, which are
 ///    parameterizing the ordering of the price-to-level map in the halfbooks.
-enum AsksOrBidsBestPricesIter<'guard> {
-    Asks(BestPricesIter__<'guard, AskPrice>),
-    Bids(BestPricesIter__<'guard, BidPrice>),
+enum AsksOrBidsBestPricesIter<'book> {
+    Asks(BestPricesIter__<'book, AskPrice>),
+    Bids(BestPricesIter__<'book, BidPrice>),
 }
 
-impl<'guard> Iterator for AsksOrBidsBestPricesIter<'guard> {
-    type Item = (&'guard Price, &'guard mut Level);
+impl<'book> Iterator for AsksOrBidsBestPricesIter<'book> {
+    type Item = (&'book Price, &'book mut Level);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -411,12 +420,12 @@ impl<'guard> Iterator for AsksOrBidsBestPricesIter<'guard> {
     }
 }
 
-pub struct BestPricesIter<'guard> {
-    inner: AsksOrBidsBestPricesIter<'guard>,
+struct BestPricesIter<'book> {
+    inner: AsksOrBidsBestPricesIter<'book>,
 }
 
-impl<'guard> Iterator for BestPricesIter<'guard> {
-    type Item = (&'guard Price, &'guard mut Level);
+impl<'book> Iterator for BestPricesIter<'book> {
+    type Item = (&'book Price, &'book mut Level);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
@@ -428,6 +437,17 @@ impl<'guard> Iterator for BestPricesIter<'guard> {
 pub struct Book {
     asks: Half<AskPrice>,
     bids: Half<BidPrice>,
+
+    /// A map of order ID to its order side and price. The side
+    /// is used to identify the correct halfbook, the price to
+    /// get the correct level.
+    ///
+    /// An entry in this map must correspond to an entry in
+    /// the respective halfbook.
+    ///
+    /// TODO: Use a cheaper hasher. FxHash, rapidhash, GxHash?
+    /// rapidhash contains a nice summary.
+    id_to_side_and_price: HashMap<order::Id, (order::Side, Price)>,
 }
 
 impl Book {
@@ -436,6 +456,7 @@ impl Book {
         Self {
             asks: Half::new(),
             bids: Half::new(),
+            id_to_side_and_price: HashMap::new(),
         }
     }
 
@@ -455,10 +476,11 @@ impl Book {
         mut order: order::Order,
         log: &mut transaction::Log,
     ) -> Result<(), AddOrderError> {
-        if self.contains(&order) {
+        if self.contains(order.id()) {
             return Err(AddOrderError::IdAlreadyExists(order));
         }
 
+        let events_before = log.events.len();
         if order.is_post_only() {
             if self.does_order_cross_market(&order) {
                 return Err(AddOrderError::PostOnlyWouldCrossMarket(order));
@@ -492,13 +514,10 @@ impl Book {
                 });
             }
 
-            'level_loop: for (current_price, level) in
-                self.iter_best_prices_mut(&order.side().opposite())
+            'level_loop: for (_current_price, level) in
+                self.iter_level_on_side(&order.side().opposite())
             {
-                if order.is_filled()
-                    || current_price
-                        .is_better_than_or_equal_to(order.price(), &order.side().opposite())
-                {
+                if order.is_filled() || level.is_crossed_by_order(&order) {
                     break 'level_loop;
                 }
                 level.match_order(&mut order, log);
@@ -507,8 +526,16 @@ impl Book {
             self.drop_empty_levels(&order.side().opposite());
         }
 
+        // Clear those orders from the book that have been filled during the last match.
+        for event in &log.events[events_before..] {
+            if let transaction::Event::MakerFilled(transaction::MakerFilled { id, .. }) = event {
+                let _old = self.id_to_side_and_price.remove(id);
+                crate::debug_assert_some!(_old);
+            }
+        }
+
         if order.is_filled() {
-            log.push(transaction::Event::Fill {
+            log.push(transaction::Event::TakerFilled {
                 id: *order.id(),
                 side: *order.side(),
             });
@@ -522,35 +549,29 @@ impl Book {
     /// Cancels an order identified by its `id`.
     ///
     /// Returns if an order was removed (i.e. if an order of `key` was known by the system).
-    pub fn cancel_order(&mut self, key: &Key) -> Option<order::Order> {
-        match key.side {
-            order::Side::Ask => self.asks.cancel(&key.id),
-            order::Side::Bid => self.bids.cancel(&key.id),
-        }
+    pub fn cancel_order(&mut self, id: &order::Id) -> Option<order::Order> {
+        let (side, price) = self.id_to_side_and_price.get(id)?;
+        Some(match side {
+            order::Side::Ask => self.asks.cancel(id, *price),
+            order::Side::Bid => self.bids.cancel(id, *price),
+        })
     }
 
-    /// Returns if the order is known by the orderbook.
-    ///
-    /// This function checks if `order.id` exists in the orderbook.
-    pub fn contains(&self, order: &order::Order) -> bool {
-        match order.side() {
-            order::Side::Ask => self.asks.contains(order.id()),
-            order::Side::Bid => self.bids.contains(order.id()),
-        }
+    /// Returns if the order [`id`] is known by the orderbook.
+    pub fn contains(&self, id: &order::Id) -> bool {
+        self.id_to_side_and_price.contains_key(id)
     }
 
     /// Returns if [`order`] crosses the market.
+    ///
+    /// An ask order crosses the market if its ask price is lower than or equal to the bid price on the book.
+    /// A bid order crosses the market if its bid price is lower than or equal to the ask price on the book.
     pub fn does_order_cross_market(&self, order: &order::Order) -> bool {
         match order.side() {
-            order::Side::Ask => self
-                .bids
-                .best_price()
-                .is_some_and(|best_price| best_price > order.price()),
-            order::Side::Bid => self
-                .asks
-                .best_price()
-                .is_some_and(|best_price| best_price < order.price()),
+            order::Side::Ask => self.bids.best_price_level(),
+            order::Side::Bid => self.asks.best_price_level(),
         }
+        .is_some_and(|level| level.is_crossed_by_order(order))
     }
 
     /// Returns whether the [`side`] of the book has enough volume to satisfy the [`requested`] amount.
@@ -588,6 +609,8 @@ impl Book {
     /// crossing the book, duplicate order IDs, zero quantity requested, and
     /// others).
     fn add_order_unchecked(&mut self, order: order::Order) {
+        self.id_to_side_and_price
+            .insert(*order.id(), (*order.side(), *order.price()));
         match *order.side() {
             order::Side::Ask => self.asks.add_order_unchecked(order),
             order::Side::Bid => self.bids.add_order_unchecked(order),
@@ -608,7 +631,7 @@ impl Book {
         }
     }
 
-    fn iter_best_prices_mut(&mut self, side: &order::Side) -> BestPricesIter<'_> {
+    fn iter_level_on_side(&mut self, side: &order::Side) -> BestPricesIter<'_> {
         match side {
             order::Side::Ask => BestPricesIter {
                 inner: AsksOrBidsBestPricesIter::Asks(BestPricesIter__ {

@@ -3,7 +3,7 @@ use crate::order;
 /// The sequence of transactions that was done to match an order.
 pub struct Log {
     order_id: order::Id,
-    events: Vec<Event>,
+    pub(crate) events: Vec<Event>,
 }
 
 impl Log {
@@ -23,8 +23,11 @@ impl Log {
 pub enum Event {
     /// An order that was added to the orderbook.
     Added(order::Order),
-    /// An order that has been filled. If the order was in the orderbook it is subsequently removed.
-    Fill { id: order::Id, side: order::Side },
+    /// An maker order that has been filled and is subsequently removed from the orderbook.
+    MakerFilled(MakerFilled),
+    /// A taker order that has been filled. These never make it to the orderbook.
+    // TODO: it might make sense to keep this in the `Log`?
+    TakerFilled { id: order::Id, side: order::Side },
     Match {
         /// The ID of the order that triggered a match, i.e. the order that is being filled by
         /// the passive order.
@@ -36,4 +39,9 @@ pub enum Event {
         /// The quantity that was exchanged.
         quantity: crate::order::Quantity,
     },
+}
+
+pub struct MakerFilled {
+    pub id: order::Id,
+    pub side: order::Side,
 }
