@@ -169,9 +169,7 @@ pub enum TimeInForce {
     GoodTillCanceled,
     ImmediateOrCancel,
     FillOrKill,
-    // XXX Don't implement all-or-none for now. Having these on the orderbook creates a headache
-    // when determining if there is enough liquidity to short circuit fill-or-kill or market orders.
-    // AllOrNone,
+    AllOrNone,
     // GoodTillDate,
 }
 
@@ -257,6 +255,10 @@ impl Order {
         self.quantity.is_zero()
     }
 
+    pub fn is_fill_or_kill(&self) -> bool {
+        matches!(self.time_in_force, TimeInForce::FillOrKill)
+    }
+
     pub fn is_market(&self) -> bool {
         matches!(self.type_, Type::Market,)
     }
@@ -283,6 +285,9 @@ impl Order {
     }
 
     pub fn needs_full_execution(&self) -> bool {
-        matches!(self.time_in_force, TimeInForce::FillOrKill)
+        matches!(
+            self.time_in_force,
+            TimeInForce::FillOrKill | TimeInForce::AllOrNone
+        )
     }
 }

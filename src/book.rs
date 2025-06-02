@@ -8,6 +8,8 @@ use crate::{
 #[derive(Debug, PartialEq, Eq)]
 pub enum AddOrderError {
     IdAlreadyExists(order::Order),
+    /// Error to report insufficient liquidity for fill-or-kill orders.
+    // TODO: should this be treated as an error or as a regular event?
     InsufficientLiquidity {
         taker_side: crate::order::Side,
         market_side: crate::order::Side,
@@ -116,24 +118,29 @@ impl Level {
     fn match_order(&mut self, taker: &mut order::Order, log: &mut transaction::Log) {
         let price = self.price;
 
-        let mut quantity;
+        let mut quantity = order::Quantity::zero();
 
         'match_loop: while let Some(mut maker) = self.inner.pop_front() {
-            if taker.quantity() > maker.quantity() {
+            if taker.quantity() >= maker.quantity() {
                 quantity = taker.quantity().saturating_sub(maker.quantity());
                 taker.quantity = taker.quantity().saturating_sub(&quantity);
                 maker.quantity = order::Quantity::zero();
-            } else {
+            } else if !maker.needs_full_execution() {
                 quantity = maker.quantity().saturating_sub(maker.quantity());
                 maker.quantity = maker.quantity().saturating_sub(&quantity);
                 taker.quantity = order::Quantity::zero();
             }
-            log.push(transaction::Event::Match {
-                taker_order_id: *taker.id(),
-                maker_order_id: *maker.id(),
-                price,
-                quantity,
-            });
+
+            // A match only happened if the amount exchanged isn't zero. This covers the
+            // case where the maker needs full execution, i.e. all-or-none.
+            if !quantity.is_zero() {
+                log.push(transaction::Event::Match {
+                    taker_order_id: *taker.id(),
+                    maker_order_id: *maker.id(),
+                    price,
+                    quantity,
+                });
+            }
             if maker.is_filled() {
                 log.push(transaction::Event::MakerFilled(transaction::MakerFilled {
                     id: *maker.id(),
@@ -146,6 +153,11 @@ impl Level {
                 break 'match_loop;
             }
         }
+    }
+
+    /// Returns an iterator over the orders at this level.
+    fn orders(&self) -> impl Iterator<Item = &order::Order> {
+        self.inner.iter()
     }
 }
 /// Ask prices. Used for ordering prices in ascending order.
@@ -341,24 +353,30 @@ where
         &vol >= requested
     }
 
-    /// Returns the total quantity in the halfbook at `price` or better (less or more, depengin on ask or bid).
+    /// Checks if the halfbook has enough volume at `price` or better to fill the `requested` amount.
     fn has_enough_volume_at_price_or_better(
         &self,
         price: &Price,
         requested: &order::Quantity,
     ) -> bool {
-        let mut vol = order::Quantity::zero();
+        let mut still_needed = *requested;
         for (_price, level) in self.levels.range(..=TPrice::from(*price)) {
-            vol = vol.saturating_add(&level.calculate_volume());
-            // shortcircuit so that this iterator does not keep walking the underlying btree.
-            //
-            // TODO: check if this is actually cache efficient. might also need revisiting if
-            // the underlying datastructure changes.
-            if &vol >= requested {
-                return true;
+            for order in level.orders() {
+                if order.needs_full_execution() {
+                    // Only consider the volume of this maker order if it could executed in full, skip otherwise.
+                    if &still_needed >= order.quantity() {
+                        still_needed = still_needed.saturating_sub(order.quantity());
+                    }
+                } else {
+                    still_needed = still_needed.saturating_sub(order.quantity());
+                }
+                // short-circuit so that this iterator does not keep walking the full btree.
+                if still_needed.is_zero() {
+                    return true;
+                }
             }
         }
-        &vol >= requested
+        still_needed.is_zero()
     }
 }
 
@@ -471,7 +489,7 @@ impl Book {
     }
 
     /// Adds an incoming order to the order book, triggering a matching process.
-    pub fn add_order(
+    pub fn match_and_add(
         &mut self,
         mut order: order::Order,
         log: &mut transaction::Log,
@@ -487,43 +505,46 @@ impl Book {
             }
         } else {
             if order.is_market() {
-                // Sets the market price to either the worst price on the book (so that
-                // the order will be done against the entire book), or to the best price +/-
-                // slippage if the order contains slippage.
                 self.set_market_order_price(&mut order);
             }
 
-            // XXX: Right now we don't permit orders in the book that require full execution.
-            // This means that all-or-none and fill-or-kill orders are functionally equivalent.
-            // The reason is that all-or-none orders are a headache both when matching and also
-            // when short circuiting: checking if there is enough liquidity requires a full
-            // execution, whereas actually executing requires either two passes over the data (
-            // one to check if a full execution would be possible, and then to do the execution),
-            // or alternatively a roll-back mechanism that undoes the transaction.
-            if order.needs_full_execution()
-                && !self.has_enough_volume_on_side_at_price_or_better(
-                    &order.side().opposite(),
-                    &order.price,
-                    &order.quantity,
-                )
-            {
-                return Err(AddOrderError::InsufficientLiquidity {
-                    taker_side: *order.side(),
-                    market_side: order.side().opposite(),
-                    requested: *order.quantity(),
-                });
-            }
+            'match_block: {
+                if order.needs_full_execution()
+                    && !self.has_enough_volume_on_side_at_price_or_better(
+                        &order.side().opposite(),
+                        &order.price,
+                        &order.quantity,
+                    )
+                {
+                    // there are two types of orders that need full execution:
+                    // 1. fill-or-kill,
+                    // 2. all-or-none.
+                    //
+                    // Fill-or-kill are rejected immediately, all-or-none are
+                    // put into the orderbook.
 
-            'level_loop: for (_current_price, level) in
-                self.iter_level_on_side(&order.side().opposite())
-            {
-                if order.is_filled() || level.is_crossed_by_order(&order) {
-                    break 'level_loop;
+                    if order.is_fill_or_kill() {
+                        return Err(AddOrderError::InsufficientLiquidity {
+                            taker_side: *order.side(),
+                            market_side: order.side().opposite(),
+                            requested: *order.quantity(),
+                        });
+                    }
+
+                    break 'match_block;
                 }
-                level.match_order(&mut order, log);
-            }
 
-            self.drop_empty_levels(&order.side().opposite());
+                'level_loop: for (_current_price, level) in
+                    self.iter_level_on_side(&order.side().opposite())
+                {
+                    if order.is_filled() || level.is_crossed_by_order(&order) {
+                        break 'level_loop;
+                    }
+                    level.match_order(&mut order, log);
+                }
+
+                self.drop_empty_levels(&order.side().opposite());
+            }
         }
 
         // Clear those orders from the book that have been filled during the last match.

@@ -27,7 +27,7 @@ impl MatchEngine {
 
     pub fn add_order(&mut self, order: order::Order) -> Result<transaction::Log, ExecutionError> {
         let mut log = transaction::Log::for_order(&order);
-        self.the_order_book.add_order(order, &mut log)?;
+        self.the_order_book.match_and_add(order, &mut log)?;
         Ok(log)
     }
 }
