@@ -71,13 +71,20 @@ impl Level {
     /// + level.side is ask and level.price <= order.price,
     /// + level.side is bid and level.price >= order.price
     ///
+    /// If `order` is a stop order, then order.stop_price is used instead.
+    ///
     /// This function assumes that [`order`] has the opposite side of the level.
     /// If it does not then this method is meaningless.
     fn is_crossed_by_order(&self, order: &order::Order) -> bool {
         debug_assert_eq!(self.side, order.side.opposite());
+        let order_price = if order.is_stop() {
+            order.stop_price()
+        } else {
+            order.price()
+        };
         match &self.side {
-            order::Side::Ask => &self.price <= order.price(),
-            order::Side::Bid => &self.price >= order.price(),
+            order::Side::Ask => &self.price <= order_price,
+            order::Side::Bid => &self.price >= order_price,
         }
     }
 
@@ -259,8 +266,13 @@ struct Half<TPrice> {
     /// The price-time levels of the halfbook.
     ///
     /// Prices are indices into the map, with the
-    /// levels expected to keep a time-ordering.
+    /// levels themselves keeping a time-ordering.
     levels: BTreeMap<TPrice, Level>,
+    /// Price-time levels of stop and stop-limit orders in the halfbook that
+    /// are waiting to be activated.
+    ///
+    /// These are ordered by the price at which they would activate.
+    stop_orders: BTreeMap<TPrice, Level>,
 }
 
 impl<TPrice> Half<TPrice>
@@ -272,6 +284,7 @@ where
         Self {
             side: TPrice::side(),
             levels: BTreeMap::new(),
+            stop_orders: BTreeMap::new(),
         }
     }
 }
@@ -288,11 +301,26 @@ where
     /// This method is supposed to only be called from [`Book`], which
     /// enforces these invariants.
     // TODO: Can we use borrow semantics to borrow P as TPrice instead?
-    fn cancel<P: Into<TPrice>>(&mut self, id: &order::Id, price: P) -> order::Order {
-        let level = self
-            .levels
-            .get_mut(&price.into())
-            .expect("invariant violated: `price` passed down from Book must map to a level");
+    fn cancel<P: Into<TPrice>>(
+        &mut self,
+        id: &order::Id,
+        type_: &order::Type,
+        price: P,
+    ) -> order::Order {
+        let level = match type_ {
+            order::Type::Limit => self
+                .levels
+                .get_mut(&price.into())
+                .expect("invariant violated: `price` passed down from Book must map to a level"),
+            order::Type::Stop | order::Type::StopLimit => self
+                .stop_orders
+                .get_mut(&price.into())
+                .expect("invariant violated: `price` passed down from Book must map to a level"),
+
+            order::Type::Market => {
+                unimplemented!("market orders must not be stored in the halfbook")
+            }
+        };
         level
             .remove_order(id)
             .expect("invariant violated: `id` passed down from Book must exist at this level")
@@ -389,10 +417,19 @@ where
     /// Panics if an order with the same ID already exists in the halfbook.
     fn add_order_unchecked(&mut self, order: order::Order) {
         // TODO: What are reasonable default sizes for the preallocated buffers?
-        let level = self
-            .levels
-            .entry(TPrice::from(*order.price()))
-            .or_insert_with(|| Level::new(*order.price(), self.side));
+        let level = match order.type_() {
+            order::Type::Limit => self
+                .levels
+                .entry(TPrice::from(*order.price()))
+                .or_insert_with(|| Level::new(*order.price(), self.side)),
+            order::Type::Stop | order::Type::StopLimit => self
+                .stop_orders
+                .entry(TPrice::from(*order.stop_price()))
+                .or_insert_with(|| Level::new(*order.stop_price(), self.side)),
+            order::Type::Market => {
+                unimplemented!("market orders must not be stored in the halfbook")
+            }
+        };
         level.push_order(order);
     }
 }
@@ -456,16 +493,17 @@ pub struct Book {
     asks: Half<AskPrice>,
     bids: Half<BidPrice>,
 
-    /// A map of order ID to its order side and price. The side
-    /// is used to identify the correct halfbook, the price to
-    /// get the correct level.
+    /// A map of order ID to its order side, type, and price.
+    /// The side is to identify the correct halfbook, the type to
+    /// get the corresponding level kind, and the price to get
+    /// the correct price level itself.
     ///
     /// An entry in this map must correspond to an entry in
     /// the respective halfbook.
     ///
     /// TODO: Use a cheaper hasher. FxHash, rapidhash, GxHash?
     /// rapidhash contains a nice summary.
-    id_to_side_and_price: HashMap<order::Id, (order::Side, Price)>,
+    id_to_side_and_price: HashMap<order::Id, (order::Side, order::Type, Price)>,
 }
 
 impl Book {
@@ -499,11 +537,24 @@ impl Book {
         }
 
         let events_before = log.events.len();
-        if order.is_post_only() {
-            if self.does_order_cross_market(&order) {
+        if self.does_order_cross_market(&order) {
+            if order.is_post_only() {
                 return Err(AddOrderError::PostOnlyWouldCrossMarket(order));
             }
-        } else {
+
+            // if the order is a stop order and crosses the market, convert it to a market order.
+            match order.type_ {
+                order::Type::Stop => {
+                    order.type_ = order::Type::Market;
+                }
+                order::Type::StopLimit => {
+                    order.type_ = order::Type::Limit;
+                }
+                _ => {}
+            }
+        }
+
+        if !order.is_post_only() && order.is_executable() {
             if order.is_market() {
                 self.set_market_order_price(&mut order);
             }
@@ -537,7 +588,7 @@ impl Book {
                 'level_loop: for (_current_price, level) in
                     self.iter_level_on_side(&order.side().opposite())
                 {
-                    if order.is_filled() || level.is_crossed_by_order(&order) {
+                    if order.is_filled() || !level.is_crossed_by_order(&order) {
                         break 'level_loop;
                     }
                     level.match_order(&mut order, log);
@@ -571,10 +622,10 @@ impl Book {
     ///
     /// Returns if an order was removed (i.e. if an order of `key` was known by the system).
     pub fn cancel_order(&mut self, id: &order::Id) -> Option<order::Order> {
-        let (side, price) = self.id_to_side_and_price.get(id)?;
+        let (side, type_, price) = self.id_to_side_and_price.get(id)?;
         Some(match side {
-            order::Side::Ask => self.asks.cancel(id, *price),
-            order::Side::Bid => self.bids.cancel(id, *price),
+            order::Side::Ask => self.asks.cancel(id, type_, *price),
+            order::Side::Bid => self.bids.cancel(id, type_, *price),
         })
     }
 
@@ -631,7 +682,7 @@ impl Book {
     /// others).
     fn add_order_unchecked(&mut self, order: order::Order) {
         self.id_to_side_and_price
-            .insert(*order.id(), (*order.side(), *order.price()));
+            .insert(*order.id(), (*order.side(), *order.type_(), *order.price()));
         match *order.side() {
             order::Side::Ask => self.asks.add_order_unchecked(order),
             order::Side::Bid => self.bids.add_order_unchecked(order),

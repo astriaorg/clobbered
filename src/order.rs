@@ -198,11 +198,11 @@ pub struct Order {
     // [<market_price>, <best_price> + <slippage>] (for bids), and
     // [<market_price> - <slippage>, <market_price>] (for asks), respectively.
     //
-    // If slippage is not set, the market order will be filled no matter the price (this is the
-    // most dangerous) setting.
+    // If slippage is not set then slippage is considered to be infinite: the market order
+    // will be filled no matter the price (this is the most dangerous) setting.
     //
-    // If slippage is set to 0, the market order will only be executed at exactly the market price,
-    // running the risk of not being completely filled.
+    // If slippage is set to 0, the market order will only be executed at exactly the market price.
+    // The unfilled portion of the order is then cancelled.
     pub(crate) slippage: Option<Slippage>,
     // If the order is intended to be posted to the orderbook only without execution.
     // This is useful for markets makers who don't want to (partially) execute an order and only
@@ -233,6 +233,10 @@ impl Order {
         self.slippage.as_ref()
     }
 
+    pub fn stop_price(&self) -> &Price {
+        &self.stop_price
+    }
+
     /// Returns the type of the order.
     ///
     /// NOTE: `type` is a reserved keyword in Rust, hence this is called `type_`.
@@ -250,17 +254,21 @@ impl Order {
         self.side.is_bid()
     }
 
-    /// Returns if the order is filled, i.e. if its quantity is zero.
-    pub fn is_filled(&self) -> bool {
-        self.quantity.is_zero()
+    /// Returns if the order is an executable order.
+    ///
+    /// Executable orders are all limit and market orders (i.e.
+    /// not any of flavor of stop order).
+    pub fn is_executable(&self) -> bool {
+        matches!(self.type_, Type::Market | Type::Limit)
     }
 
     pub fn is_fill_or_kill(&self) -> bool {
         matches!(self.time_in_force, TimeInForce::FillOrKill)
     }
 
-    pub fn is_market(&self) -> bool {
-        matches!(self.type_, Type::Market,)
+    /// Returns if the order is filled, i.e. if its quantity is zero.
+    pub fn is_filled(&self) -> bool {
+        self.quantity.is_zero()
     }
 
     /// Returns if an order requires immediate execution.
@@ -275,6 +283,11 @@ impl Order {
             )
     }
 
+    /// Returns if the order is a market order.
+    pub fn is_market(&self) -> bool {
+        matches!(self.type_, Type::Market,)
+    }
+
     /// Returns if the order is post-only.
     ///
     /// Note that in order for orders to be post-only they must
@@ -282,6 +295,11 @@ impl Order {
     /// and not be fill-or-kill or immediate-or-cancel.
     pub fn is_post_only(&self) -> bool {
         self.post_only && !self.is_market() && !self.is_immediate()
+    }
+
+    /// Returns if the order is a stop order.
+    pub fn is_stop(&self) -> bool {
+        matches!(self.type_, Type::Stop | Type::StopLimit,)
     }
 
     pub fn needs_full_execution(&self) -> bool {
