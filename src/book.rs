@@ -8,7 +8,6 @@ use crate::{
 #[derive(Debug, PartialEq, Eq)]
 pub enum AddOrderError {
     IdAlreadyExists(order::Order),
-    PostOnlyWouldCrossMarket(order::Order),
 }
 
 /// A price-level of the orderbook.
@@ -603,7 +602,12 @@ impl Book {
         let events_before = log.events.len();
         if self.does_order_cross_market(&order) {
             if order.is_post_only() {
-                return Err(AddOrderError::PostOnlyWouldCrossMarket(order));
+                log.push(transaction::Event::Remove {
+                    id: *order.id(),
+                    side: *order.side(),
+                    unfilled_quantity: *order.quantity(),
+                });
+                return Ok(());
             }
 
             // if the order is a stop order and crosses the market, convert it to a market order.
