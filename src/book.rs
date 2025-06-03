@@ -334,6 +334,32 @@ where
 
 impl<TPrice> Half<TPrice>
 where
+    TPrice: AsRef<Price> + From<Price> + Ord,
+{
+    fn perform_match(&mut self, order: &mut order::Order, log: &mut transaction::Log) {
+        if order.is_market() {
+            self.set_market_order_price(order);
+        }
+
+        if order.needs_full_execution()
+            && !self.has_enough_volume_at_price_or_better(&order.price, &order.quantity)
+        {
+            return;
+        }
+
+        'level_loop: for (_current_price, level) in self.iter_levels() {
+            if order.is_filled() || !level.is_crossed_by_order(order) {
+                break 'level_loop;
+            }
+            level.match_order(order, log);
+        }
+
+        self.drop_empty_levels();
+    }
+}
+
+impl<TPrice> Half<TPrice>
+where
     TPrice: AsRef<Price> + Ord,
 {
     // Returns the best price stored in the halfbook.
@@ -365,9 +391,7 @@ where
     /// slippage is added; if the halfbook tracks bids, then slippage is subtracted).
     ///
     /// The caller of this function has to ensure that `order` is a market order and
-    /// that it is on the correct side.
-    ///
-    /// This method will set the order's price and not ensure that it is legal to do so.
+    /// that it is on the same side as the halfbook.
     fn set_market_order_price(&self, order: &mut order::Order) {
         debug_assert_eq!(self.side, order.side().opposite());
         debug_assert_eq!(order.type_(), &order::Type::Market);
@@ -655,31 +679,9 @@ impl Book {
         }
 
         if !order.is_post_only() && order.is_executable() {
-            if order.is_market() {
-                self.set_market_order_price(&mut order);
-            }
-
-            'match_block: {
-                if order.needs_full_execution()
-                    && !self.has_enough_volume_on_side_at_price_or_better(
-                        &order.side().opposite(),
-                        &order.price,
-                        &order.quantity,
-                    )
-                {
-                    break 'match_block;
-                }
-
-                'level_loop: for (_current_price, level) in
-                    self.iter_level_on_side(&order.side().opposite())
-                {
-                    if order.is_filled() || !level.is_crossed_by_order(&order) {
-                        break 'level_loop;
-                    }
-                    level.match_order(&mut order, log);
-                }
-
-                self.drop_empty_levels(&order.side().opposite());
+            match order.side() {
+                order::Side::Ask => self.bids.perform_match(&mut order, log),
+                order::Side::Bid => self.asks.perform_match(&mut order, log),
             }
         }
 
@@ -778,35 +780,6 @@ impl Book {
         };
     }
 
-    fn drop_empty_levels(&mut self, side: &order::Side) {
-        match side {
-            order::Side::Ask => self.asks.drop_empty_levels(),
-            order::Side::Bid => self.bids.drop_empty_levels(),
-        }
-    }
-
-    fn worst_price(&self, side: &order::Side) -> Option<&Price> {
-        match side {
-            order::Side::Ask => self.asks.worst_price(),
-            order::Side::Bid => self.bids.worst_price(),
-        }
-    }
-
-    fn iter_level_on_side(&mut self, side: &order::Side) -> BestPricesIter<'_> {
-        match side {
-            order::Side::Ask => BestPricesIter {
-                inner: AsksOrBidsBestPricesIter::Asks(BestPricesIter__ {
-                    iter: self.asks.levels.iter_mut(),
-                }),
-            },
-            order::Side::Bid => BestPricesIter {
-                inner: AsksOrBidsBestPricesIter::Bids(BestPricesIter__ {
-                    iter: self.bids.levels.iter_mut(),
-                }),
-            },
-        }
-    }
-
     /// Activates all stop orders in the orderbook.
     ///
     /// Returns if orders have been activated.
@@ -845,23 +818,7 @@ impl Book {
 
                     let events_before = log.events.len();
 
-                    'match_block: {
-                        if stop_order.needs_full_execution()
-                            && !self.asks.has_enough_volume_at_price_or_better(
-                                stop_order.price(),
-                                stop_order.quantity(),
-                            )
-                        {
-                            break 'match_block;
-                        }
-                        'level_loop: for (_current_price, level) in self.asks.iter_levels() {
-                            if stop_order.is_filled() || !level.is_crossed_by_order(&stop_order) {
-                                break 'level_loop;
-                            }
-                            level.match_order(&mut stop_order, log);
-                        }
-                        self.asks.drop_empty_levels();
-                    }
+                    self.asks.perform_match(&mut stop_order, log);
 
                     // Clear those orders from the book that have been filled during the last match.
                     for event in &log.events[events_before..] {
@@ -912,25 +869,8 @@ impl Book {
                     }
 
                     let events_before = log.events.len();
-                    'match_block: {
-                        if stop_order.needs_full_execution()
-                            && !self.bids.has_enough_volume_at_price_or_better(
-                                stop_order.price(),
-                                stop_order.quantity(),
-                            )
-                        {
-                            break 'match_block;
-                        }
 
-                        'level_loop: for (_current_price, level) in self.bids.iter_levels() {
-                            if stop_order.is_filled() || !level.is_crossed_by_order(&stop_order) {
-                                break 'level_loop;
-                            }
-                            level.match_order(&mut stop_order, log);
-                        }
-
-                        self.bids.drop_empty_levels();
-                    }
+                    self.bids.perform_match(&mut stop_order, log);
 
                     // Clear those orders from the book that have been filled during the last match.
                     for event in &log.events[events_before..] {
@@ -1068,24 +1008,6 @@ impl Book {
             if match_happened {
                 break 'full_match;
             }
-        }
-    }
-
-    /// Sets the price of the market order.
-    ///
-    /// If slippage is set, then the price will be set to the best ask/bid price
-    /// in the orderbook plus/minus the slippage.
-    ///
-    /// If no slippage is set, then the price will be set to the worst ask/bid price
-    /// (this means that when matching all price levels of the orderbook will be
-    /// matched against).
-    ///
-    /// NOTE: if no price (best or worst) can be established for the order book the
-    /// price will be left unchanged.
-    fn set_market_order_price(&self, order: &mut order::Order) {
-        match order.side() {
-            order::Side::Ask => self.bids.set_market_order_price(order),
-            order::Side::Bid => self.asks.set_market_order_price(order),
         }
     }
 }
