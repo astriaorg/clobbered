@@ -118,7 +118,14 @@ impl Level {
     /// Matches a taker [`order`] to the orders at this price level.
     ///
     /// Returns a transaction log of the executions performed.
-    fn match_order(&mut self, taker: &mut order::Order, log: &mut transaction::Log) {
+    fn match_order<FOnRemove>(
+        &mut self,
+        taker: &mut order::Order,
+        log: &mut transaction::Log,
+        mut on_remove: FOnRemove,
+    ) where
+        FOnRemove: FnMut(&order::Order),
+    {
         'match_loop: for maker in &mut self.inner {
             let mut quantity = order::Quantity::zero();
             if taker.quantity() >= maker.quantity() {
@@ -151,6 +158,7 @@ impl Level {
         // With vec-deques there is no way to pop-check-push-next.
         self.inner.retain(|order| {
             if order.is_filled() {
+                on_remove(order);
                 log.push(transaction::Event::Remove {
                     id: *order.id(),
                     side: *order.side(),
@@ -336,7 +344,14 @@ impl<TPrice> Half<TPrice>
 where
     TPrice: AsRef<Price> + From<Price> + Ord,
 {
-    fn perform_match(&mut self, order: &mut order::Order, log: &mut transaction::Log) {
+    fn perform_match<FOnRemove>(
+        &mut self,
+        order: &mut order::Order,
+        log: &mut transaction::Log,
+        mut on_remove: FOnRemove,
+    ) where
+        FOnRemove: FnMut(&order::Order),
+    {
         if order.is_market() {
             self.set_market_order_price(order);
         }
@@ -351,7 +366,7 @@ where
             if order.is_filled() || !level.is_crossed_by_order(order) {
                 break 'level_loop;
             }
-            level.match_order(order, log);
+            level.match_order(order, log, &mut on_remove);
         }
 
         self.drop_empty_levels();
@@ -655,7 +670,6 @@ impl Book {
             return Err(AddOrderError::IdAlreadyExists(order));
         }
 
-        let events_before = log.events.len();
         if self.does_order_cross_market(&order) {
             if order.is_post_only() {
                 log.push(transaction::Event::Remove {
@@ -679,17 +693,10 @@ impl Book {
         }
 
         if !order.is_post_only() && order.is_executable() {
+            let remove_fn = make_remove_fn(&mut self.id_to_side_and_price);
             match order.side() {
-                order::Side::Ask => self.bids.perform_match(&mut order, log),
-                order::Side::Bid => self.asks.perform_match(&mut order, log),
-            }
-        }
-
-        // Clear those orders from the book that have been filled during the last match.
-        for event in &log.events[events_before..] {
-            if let transaction::Event::Remove { id, .. } = event {
-                let _old = self.id_to_side_and_price.remove(id);
-                crate::debug_assert_some!(_old);
+                order::Side::Ask => self.bids.perform_match(&mut order, log, remove_fn),
+                order::Side::Bid => self.asks.perform_match(&mut order, log, remove_fn),
             }
         }
 
@@ -816,17 +823,13 @@ impl Book {
                         }
                     }
 
-                    let events_before = log.events.len();
+                    self.asks.perform_match(
+                        &mut stop_order,
+                        log,
+                        // XXX: need to construct the callback closure in the loop because we need to be able to insert the stop order into the map right after.
+                        make_remove_fn(&mut self.id_to_side_and_price),
+                    );
 
-                    self.asks.perform_match(&mut stop_order, log);
-
-                    // Clear those orders from the book that have been filled during the last match.
-                    for event in &log.events[events_before..] {
-                        if let transaction::Event::Remove { id, .. } = event {
-                            let _old = self.id_to_side_and_price.remove(id);
-                            crate::debug_assert_some!(_old);
-                        }
-                    }
                     if stop_order.is_filled() || stop_order.is_immediate() {
                         log.push(transaction::Event::Remove {
                             id: *stop_order.id(),
@@ -868,17 +871,13 @@ impl Book {
                         }
                     }
 
-                    let events_before = log.events.len();
+                    self.bids.perform_match(
+                        &mut stop_order,
+                        log,
+                        // XXX: need to construct the callback closure in the loop because we need to be able to insert the stop order into the map right after.
+                        &mut make_remove_fn(&mut self.id_to_side_and_price),
+                    );
 
-                    self.bids.perform_match(&mut stop_order, log);
-
-                    // Clear those orders from the book that have been filled during the last match.
-                    for event in &log.events[events_before..] {
-                        if let transaction::Event::Remove { id, .. } = event {
-                            let _old = self.id_to_side_and_price.remove(id);
-                            crate::debug_assert_some!(_old);
-                        }
-                    }
                     if stop_order.is_filled() || stop_order.is_immediate() {
                         log.push(transaction::Event::Remove {
                             id: *stop_order.id(),
@@ -910,6 +909,10 @@ impl Book {
             let mut match_happened = false;
             // first, execute all bids
             'match_bids: {
+                // XXX: Construct this closure here so we can pass it to the half-book matcher but
+                // drop it before running the activate-stop logic.
+                let mut remove_fn = make_remove_fn(&mut self.id_to_side_and_price);
+
                 let Some(best_ask_price) = self.asks.best_price().copied() else {
                     break 'match_bids;
                 };
@@ -920,17 +923,13 @@ impl Book {
                     let events_before = log.events.len();
                     // match every single bid to all asks
                     for bid in &mut bid_level.inner {
-                        'match_single_bid: for (_, ask_level) in self.asks.levels.iter_mut() {
-                            if bid.is_filled() || ask_level.is_crossed_by_order(bid) {
-                                break 'match_single_bid;
-                            }
-                            ask_level.match_order(bid, log);
-                        }
+                        self.asks.perform_match(bid, log, &mut remove_fn);
                     }
                     // a second pass to remove filled bids is necessary because the iterator in the
                     // previous loop needs to be stable
                     bid_level.inner.retain(|order| {
                         if order.is_filled() {
+                            remove_fn(order);
                             log.push(transaction::Event::Remove {
                                 id: *order.id(),
                                 side: *order.side(),
@@ -941,12 +940,7 @@ impl Book {
                             true
                         }
                     });
-                    for event in &log.events[events_before..] {
-                        if let transaction::Event::Remove { id, .. } = event {
-                            let _old = self.id_to_side_and_price.remove(id);
-                            crate::debug_assert_some!(_old);
-                        }
-                    }
+
                     // We use the events logged as a proxy to determine if matches happened.
                     match_happened |= log.events.len() > events_before;
                 }
@@ -957,6 +951,10 @@ impl Book {
             // then, execute all asks
             // TODO: streamline both of these loops to avoid all that duplicate logic.
             'match_asks: {
+                // XXX: Construct this closure here so we can pass it to the half-book matcher but
+                // drop it before running the activate-stop logic.
+                let mut remove_fn = make_remove_fn(&mut self.id_to_side_and_price);
+
                 let Some(best_bid_price) = self.bids.best_price().copied() else {
                     break 'match_asks;
                 };
@@ -967,17 +965,13 @@ impl Book {
                     let events_before = log.events.len();
                     // match every single bid to all asks
                     for ask in &mut ask_level.inner {
-                        'match_single_ask: for (_, bid_level) in self.bids.levels.iter_mut() {
-                            if ask.is_filled() || bid_level.is_crossed_by_order(ask) {
-                                break 'match_single_ask;
-                            }
-                            bid_level.match_order(ask, log);
-                        }
+                        self.bids.perform_match(ask, log, &mut remove_fn);
                     }
                     // a second pass to remove filled bids is necessary because the iterator in the
                     // previous loop needs to be stable
                     ask_level.inner.retain(|order| {
                         if order.is_filled() {
+                            remove_fn(order);
                             log.push(transaction::Event::Remove {
                                 id: *order.id(),
                                 side: *order.side(),
@@ -988,12 +982,7 @@ impl Book {
                             true
                         }
                     });
-                    for event in &log.events[events_before..] {
-                        if let transaction::Event::Remove { id, .. } = event {
-                            let _old = self.id_to_side_and_price.remove(id);
-                            crate::debug_assert_some!(_old);
-                        }
-                    }
+
                     // We use the events logged as a proxy to determine if matches happened.
                     match_happened |= log.events.len() > events_before;
                 }
@@ -1015,5 +1004,14 @@ impl Book {
 impl Default for Book {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn make_remove_fn(
+    map: &mut HashMap<order::Id, (order::Side, order::Type, Price)>,
+) -> impl FnMut(&order::Order) {
+    |order| {
+        let _old = map.remove(order.id());
+        crate::debug_assert_some!(_old);
     }
 }
