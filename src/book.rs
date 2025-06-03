@@ -8,13 +8,6 @@ use crate::{
 #[derive(Debug, PartialEq, Eq)]
 pub enum AddOrderError {
     IdAlreadyExists(order::Order),
-    /// Error to report insufficient liquidity for fill-or-kill orders.
-    // TODO: should this be treated as an error or as a regular event?
-    InsufficientLiquidity {
-        taker_side: crate::order::Side,
-        market_side: crate::order::Side,
-        requested: crate::order::Quantity,
-    },
     PostOnlyWouldCrossMarket(order::Order),
 }
 
@@ -178,7 +171,7 @@ impl Level {
 }
 /// Ask prices. Used for ordering prices in ascending order.
 #[derive(Debug, PartialEq, Eq)]
-pub struct AskPrice(Price);
+struct AskPrice(Price);
 
 impl Ord for AskPrice {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -195,7 +188,7 @@ impl PartialOrd for AskPrice {
 
 /// Bid prices. Used for ordering prices in descending order.
 #[derive(Debug, PartialEq, Eq)]
-pub struct BidPrice(Price);
+struct BidPrice(Price);
 
 impl Ord for BidPrice {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -638,21 +631,6 @@ impl Book {
                         &order.quantity,
                     )
                 {
-                    // there are two types of orders that need full execution:
-                    // 1. fill-or-kill,
-                    // 2. all-or-none.
-                    //
-                    // Fill-or-kill are rejected immediately, all-or-none are
-                    // put into the orderbook.
-
-                    if order.is_fill_or_kill() {
-                        return Err(AddOrderError::InsufficientLiquidity {
-                            taker_side: *order.side(),
-                            market_side: order.side().opposite(),
-                            requested: *order.quantity(),
-                        });
-                    }
-
                     break 'match_block;
                 }
 
@@ -833,15 +811,16 @@ impl Book {
                     }
 
                     let events_before = log.events.len();
-                    if stop_order.needs_full_execution()
-                        && !self.asks.has_enough_volume_at_price_or_better(
-                            stop_order.price(),
-                            stop_order.quantity(),
-                        )
-                    {
-                        // TODO: stop execution here. In the high level match loop this generates an error, which we can't and don't want to do here..
-                        // It should probably not produce an error and instead add a new event to the log.
-                    } else {
+
+                    'match_block: {
+                        if stop_order.needs_full_execution()
+                            && !self.asks.has_enough_volume_at_price_or_better(
+                                stop_order.price(),
+                                stop_order.quantity(),
+                            )
+                        {
+                            break 'match_block;
+                        }
                         'level_loop: for (_current_price, level) in self.asks.iter_levels() {
                             if stop_order.is_filled() || !level.is_crossed_by_order(&stop_order) {
                                 break 'level_loop;
@@ -858,13 +837,13 @@ impl Book {
                             crate::debug_assert_some!(_old);
                         }
                     }
-                    if stop_order.is_filled() {
+                    if stop_order.is_filled() || stop_order.is_immediate() {
                         log.push(transaction::Event::Remove {
                             id: *stop_order.id(),
                             side: *stop_order.side(),
                             unfilled_quantity: order::Quantity::zero(),
                         });
-                    } else if !stop_order.is_immediate() {
+                    } else {
                         log.push(transaction::Event::Added(stop_order.clone()));
                         self.id_to_side_and_price.insert(*stop_order.id(), (*stop_order.side(), *stop_order.type_(), *stop_order.price()))
                             .expect("invariant violated: at the beginning of the loop we have removed this order from the book, and so it must not exist in the map");
@@ -903,21 +882,23 @@ impl Book {
                     }
 
                     let events_before = log.events.len();
-                    if stop_order.needs_full_execution()
-                        && !self.bids.has_enough_volume_at_price_or_better(
-                            stop_order.price(),
-                            stop_order.quantity(),
-                        )
-                    {
-                        // TODO: stop execution here. In the high level match loop this generates an error, which we can't and don't want to do here..
-                        // It should probably not produce an error and instead add a new event to the log.
-                    } else {
+                    'match_block: {
+                        if stop_order.needs_full_execution()
+                            && !self.bids.has_enough_volume_at_price_or_better(
+                                stop_order.price(),
+                                stop_order.quantity(),
+                            )
+                        {
+                            break 'match_block;
+                        }
+
                         'level_loop: for (_current_price, level) in self.bids.iter_levels() {
                             if stop_order.is_filled() || !level.is_crossed_by_order(&stop_order) {
                                 break 'level_loop;
                             }
                             level.match_order(&mut stop_order, log);
                         }
+
                         self.bids.drop_empty_levels();
                     }
 
