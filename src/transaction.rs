@@ -23,11 +23,8 @@ impl Log {
 pub enum Event {
     /// An order that was added to the orderbook.
     Added(order::Order),
-    /// An maker order that has been filled and is subsequently removed from the orderbook.
-    MakerFilled(Filled),
-    /// A taker order that has been filled. These never make it to the orderbook.
-    // TODO: it might make sense to keep this in the `Log`?
-    TakerFilled(Filled),
+    /// An order that has been fully executed and, if it was on the orderbook, removed from the orderbook.
+    Filled { id: order::Id, side: order::Side },
     Match {
         /// The ID of the order that triggered a match, i.e. the order that is being filled by
         /// the passive order.
@@ -39,9 +36,4 @@ pub enum Event {
         /// The quantity that was exchanged.
         quantity: crate::order::Quantity,
     },
-}
-
-pub struct Filled {
-    pub id: order::Id,
-    pub side: order::Side,
 }

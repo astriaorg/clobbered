@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    fmt::Pointer,
-};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::{
     order::{self, Price},
@@ -162,10 +159,10 @@ impl Level {
         // With vec-deques there is no way to pop-check-push-next.
         self.inner.retain(|order| {
             if order.is_filled() {
-                log.push(transaction::Event::MakerFilled(transaction::Filled {
+                log.push(transaction::Event::Filled {
                     id: *order.id(),
                     side: *order.side(),
-                }));
+                });
                 false
             } else {
                 true
@@ -673,17 +670,17 @@ impl Book {
 
         // Clear those orders from the book that have been filled during the last match.
         for event in &log.events[events_before..] {
-            if let transaction::Event::MakerFilled(transaction::Filled { id, .. }) = event {
+            if let transaction::Event::Filled { id, .. } = event {
                 let _old = self.id_to_side_and_price.remove(id);
                 crate::debug_assert_some!(_old);
             }
         }
 
         if order.is_filled() {
-            log.push(transaction::Event::TakerFilled(transaction::Filled {
+            log.push(transaction::Event::Filled {
                 id: *order.id(),
                 side: *order.side(),
-            }));
+            });
         } else if !order.is_immediate() {
             log.push(transaction::Event::Added(order.clone()));
             self.add_order_unchecked(order);
@@ -854,18 +851,16 @@ impl Book {
 
                     // Clear those orders from the book that have been filled during the last match.
                     for event in &log.events[events_before..] {
-                        if let transaction::Event::MakerFilled(transaction::Filled { id, .. }) =
-                            event
-                        {
+                        if let transaction::Event::Filled { id, .. } = event {
                             let _old = self.id_to_side_and_price.remove(id);
                             crate::debug_assert_some!(_old);
                         }
                     }
                     if stop_order.is_filled() {
-                        log.push(transaction::Event::MakerFilled(transaction::Filled {
+                        log.push(transaction::Event::Filled {
                             id: *stop_order.id(),
                             side: *stop_order.side(),
-                        }));
+                        });
                     } else if !stop_order.is_immediate() {
                         log.push(transaction::Event::Added(stop_order.clone()));
                         self.id_to_side_and_price.insert(*stop_order.id(), (*stop_order.side(), *stop_order.type_(), *stop_order.price()))
@@ -925,18 +920,16 @@ impl Book {
 
                     // Clear those orders from the book that have been filled during the last match.
                     for event in &log.events[events_before..] {
-                        if let transaction::Event::MakerFilled(transaction::Filled { id, .. }) =
-                            event
-                        {
+                        if let transaction::Event::Filled { id, .. } = event {
                             let _old = self.id_to_side_and_price.remove(id);
                             crate::debug_assert_some!(_old);
                         }
                     }
                     if stop_order.is_filled() {
-                        log.push(transaction::Event::TakerFilled(transaction::Filled {
+                        log.push(transaction::Event::Filled {
                             id: *stop_order.id(),
                             side: *stop_order.side(),
-                        }));
+                        });
                     } else if !stop_order.is_immediate() {
                         log.push(transaction::Event::Added(stop_order.clone()));
                         self.id_to_side_and_price.insert(*stop_order.id(), (*stop_order.side(), *stop_order.type_(), *stop_order.price()))
@@ -983,19 +976,17 @@ impl Book {
                     // previous loop needs to be stable
                     bid_level.inner.retain(|order| {
                         if order.is_filled() {
-                            log.push(transaction::Event::MakerFilled(transaction::Filled {
+                            log.push(transaction::Event::Filled {
                                 id: *order.id(),
                                 side: *order.side(),
-                            }));
+                            });
                             false
                         } else {
                             true
                         }
                     });
                     for event in &log.events[events_before..] {
-                        if let transaction::Event::MakerFilled(transaction::Filled { id, .. })
-                        | transaction::Event::TakerFilled(transaction::Filled { id, .. }) = event
-                        {
+                        if let transaction::Event::Filled { id, .. } = event {
                             let _old = self.id_to_side_and_price.remove(id);
                             crate::debug_assert_some!(_old);
                         }
@@ -1031,19 +1022,17 @@ impl Book {
                     // previous loop needs to be stable
                     ask_level.inner.retain(|order| {
                         if order.is_filled() {
-                            log.push(transaction::Event::MakerFilled(transaction::Filled {
+                            log.push(transaction::Event::Filled {
                                 id: *order.id(),
                                 side: *order.side(),
-                            }));
+                            });
                             false
                         } else {
                             true
                         }
                     });
                     for event in &log.events[events_before..] {
-                        if let transaction::Event::MakerFilled(transaction::Filled { id, .. })
-                        | transaction::Event::TakerFilled(transaction::Filled { id, .. }) = event
-                        {
+                        if let transaction::Event::Filled { id, .. } = event {
                             let _old = self.id_to_side_and_price.remove(id);
                             crate::debug_assert_some!(_old);
                         }
