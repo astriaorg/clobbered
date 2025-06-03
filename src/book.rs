@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    fmt::Pointer,
+};
 
 use crate::{
     order::{self, Price},
@@ -88,8 +91,12 @@ impl Level {
         }
     }
 
+    fn pop(&mut self) -> Option<order::Order> {
+        self.inner.pop_front()
+    }
+
     /// Pushes a new order to the back of the level.
-    fn push_order(&mut self, order: order::Order) {
+    fn push(&mut self, order: order::Order) {
         debug_assert_eq!(&self.side, order.side());
         self.inner.push_back(order);
     }
@@ -123,11 +130,8 @@ impl Level {
     ///
     /// Returns a transaction log of the executions performed.
     fn match_order(&mut self, taker: &mut order::Order, log: &mut transaction::Log) {
-        let price = self.price;
-
-        let mut quantity = order::Quantity::zero();
-
-        'match_loop: while let Some(mut maker) = self.inner.pop_front() {
+        'match_loop: for maker in &mut self.inner {
+            let mut quantity = order::Quantity::zero();
             if taker.quantity() >= maker.quantity() {
                 quantity = taker.quantity().saturating_sub(maker.quantity());
                 taker.quantity = taker.quantity().saturating_sub(&quantity);
@@ -144,22 +148,29 @@ impl Level {
                 log.push(transaction::Event::Match {
                     taker_order_id: *taker.id(),
                     maker_order_id: *maker.id(),
-                    price,
+                    price: self.price,
                     quantity,
                 });
-            }
-            if maker.is_filled() {
-                log.push(transaction::Event::MakerFilled(transaction::MakerFilled {
-                    id: *maker.id(),
-                    side: *maker.side(),
-                }))
-            } else {
-                self.inner.push_front(maker);
             }
             if taker.is_filled() {
                 break 'match_loop;
             }
         }
+
+        // The second pass over the level is needed to remove all orders with zero quantity.
+        // Unfortunately this is necessary because an iterator needs to be stable during iteration.
+        // With vec-deques there is no way to pop-check-push-next.
+        self.inner.retain(|order| {
+            if order.is_filled() {
+                log.push(transaction::Event::MakerFilled(transaction::Filled {
+                    id: *order.id(),
+                    side: *order.side(),
+                }));
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Returns an iterator over the orders at this level.
@@ -351,6 +362,12 @@ where
         self.levels.first_key_value().map(|(_, level)| level)
     }
 
+    fn iter_levels(&mut self) -> impl Iterator<Item = (&Price, &mut Level)> {
+        self.levels
+            .iter_mut()
+            .map(|(price, level)| (price.as_ref(), level))
+    }
+
     // Returns the best price stored in the halfbook.
     //
     // Depending on how it's parameterized, this is either the highest ask price or the lowest bid price.
@@ -361,10 +378,66 @@ where
     }
 }
 
+struct ActivateStopOrders<'book, TPrice> {
+    side: order::Side,
+    halfbook: &'book mut Half<TPrice>,
+    draining_level: Option<Level>,
+    reference_price: TPrice,
+}
+
+impl<'book, TPrice> ActivateStopOrders<'book, TPrice>
+where
+    TPrice: Ord,
+{
+    fn next_activating_order(&mut self) -> Option<order::Order> {
+        loop {
+            if let Some(order) = self.draining_level.as_mut().and_then(Level::pop) {
+                return Some(order);
+            };
+
+            // XXX: remember that TPrice has different PartialOrd implementations depending on which
+            // level we are at: ask prices are ordered in ascending order (like regular integers),
+            // whiile bid prices are in descending order, which means that bid.price_1 < bid.price_2
+            // evaluates to true bid.price_1 is *greater* than bid.price_2.
+            //
+            // NOTE: the ? operator is responsible for breaking loop (easily overlooked).
+            if self.halfbook.stop_orders.first_key_value()?.0 <= &self.reference_price {
+                self.draining_level = self
+                    .halfbook
+                    .stop_orders
+                    .pop_first()
+                    .map(|(_price, level)| level);
+            }
+        }
+    }
+}
+
+impl<'book, TPrice> ActivateStopOrders<'book, TPrice>
+where
+    TPrice: From<Price> + Ord + std::fmt::Debug,
+{
+    /// Adds an order to the halfbook.
+    ///
+    /// Panics if an order with the same ID already exists in the halfbook.
+    fn add_order_unchecked(&mut self, order: order::Order) {
+        self.halfbook.add_order_unchecked(order);
+    }
+}
+
 impl<TPrice> Half<TPrice>
 where
     TPrice: From<Price> + Ord,
 {
+    /// Starts the process of activating stop orders in the halfbook.
+    fn start_activate_stop_orders(&mut self, price: &Price) -> ActivateStopOrders<'_, TPrice> {
+        ActivateStopOrders {
+            side: self.side,
+            halfbook: self,
+            draining_level: None,
+            reference_price: TPrice::from(*price),
+        }
+    }
+
     fn has_enough_volume(&self, requested: &order::Quantity) -> bool {
         let mut vol = order::Quantity::zero();
 
@@ -430,7 +503,7 @@ where
                 unimplemented!("market orders must not be stored in the halfbook")
             }
         };
-        level.push_order(order);
+        level.push(order);
     }
 }
 
@@ -600,21 +673,24 @@ impl Book {
 
         // Clear those orders from the book that have been filled during the last match.
         for event in &log.events[events_before..] {
-            if let transaction::Event::MakerFilled(transaction::MakerFilled { id, .. }) = event {
+            if let transaction::Event::MakerFilled(transaction::Filled { id, .. }) = event {
                 let _old = self.id_to_side_and_price.remove(id);
                 crate::debug_assert_some!(_old);
             }
         }
 
         if order.is_filled() {
-            log.push(transaction::Event::TakerFilled {
+            log.push(transaction::Event::TakerFilled(transaction::Filled {
                 id: *order.id(),
                 side: *order.side(),
-            });
+            }));
         } else if !order.is_immediate() {
             log.push(transaction::Event::Added(order.clone()));
             self.add_order_unchecked(order);
         }
+
+        self.perform_full_match(log);
+
         Ok(())
     }
 
@@ -715,6 +791,277 @@ impl Book {
                     iter: self.bids.levels.iter_mut(),
                 }),
             },
+        }
+    }
+
+    /// Activates all stop orders in the orderbook.
+    ///
+    /// Returns if orders have been activated.
+    fn activate_stop_orders(&mut self, log: &mut crate::transaction::Log) {
+        'activation: loop {
+            let mut have_activations_happened_on_iteration = false;
+
+            // activate bids
+            //
+            // TODO: there is a lot of duplication here. We should merge bid & ask activation, and also
+            // the high Book::match_and_add.
+            {
+                let Some(best_ask_price) = self.asks.best_price().copied() else {
+                    break 'activation;
+                };
+                let mut activation = self.bids.start_activate_stop_orders(&best_ask_price);
+
+                while let Some(mut stop_order) = activation.next_activating_order() {
+                    have_activations_happened_on_iteration = true;
+
+                    let _ = self.id_to_side_and_price.remove(stop_order.id()).expect(
+                        "invariant violated: a stop order at a level must be tracked by the book",
+                    );
+                    match stop_order.type_ {
+                        order::Type::Stop => {
+                            stop_order.type_ = order::Type::Market;
+                            stop_order.price = match stop_order.slippage() {
+                                Some(slippage) => best_ask_price.minus_slippage(slippage),
+                                None => *self.asks.worst_price().expect("invariant violated: if there is best ask price, then there is a worst ask price"),
+                            };
+                        }
+                        order::Type::StopLimit => {
+                            stop_order.type_ = order::Type::Limit;
+                        }
+                        other => {
+                            unimplemented!("only stop orders can be activated; got `{other:?}`")
+                        }
+                    }
+
+                    let events_before = log.events.len();
+                    if stop_order.needs_full_execution()
+                        && !self.asks.has_enough_volume_at_price_or_better(
+                            stop_order.price(),
+                            stop_order.quantity(),
+                        )
+                    {
+                        // TODO: stop execution here. In the high level match loop this generates an error, which we can't and don't want to do here..
+                        // It should probably not produce an error and instead add a new event to the log.
+                    } else {
+                        'level_loop: for (_current_price, level) in self.asks.iter_levels() {
+                            if stop_order.is_filled() || !level.is_crossed_by_order(&stop_order) {
+                                break 'level_loop;
+                            }
+                            level.match_order(&mut stop_order, log);
+                        }
+                        self.asks.drop_empty_levels();
+                    }
+
+                    // Clear those orders from the book that have been filled during the last match.
+                    for event in &log.events[events_before..] {
+                        if let transaction::Event::MakerFilled(transaction::Filled { id, .. }) =
+                            event
+                        {
+                            let _old = self.id_to_side_and_price.remove(id);
+                            crate::debug_assert_some!(_old);
+                        }
+                    }
+                    if stop_order.is_filled() {
+                        log.push(transaction::Event::MakerFilled(transaction::Filled {
+                            id: *stop_order.id(),
+                            side: *stop_order.side(),
+                        }));
+                    } else if !stop_order.is_immediate() {
+                        log.push(transaction::Event::Added(stop_order.clone()));
+                        self.id_to_side_and_price.insert(*stop_order.id(), (*stop_order.side(), *stop_order.type_(), *stop_order.price()))
+                            .expect("invariant violated: at the beginning of the loop we have removed this order from the book, and so it must not exist in the map");
+                        activation.add_order_unchecked(stop_order);
+                    }
+                }
+            }
+
+            // activate asks
+            {
+                let Some(best_bid_price) = self.bids.best_price().copied() else {
+                    break 'activation;
+                };
+                let mut activation = self.asks.start_activate_stop_orders(&best_bid_price);
+
+                while let Some(mut stop_order) = activation.next_activating_order() {
+                    have_activations_happened_on_iteration = true;
+
+                    let _ = self.id_to_side_and_price.remove(stop_order.id()).expect(
+                        "invariant violated: a stop order at a level must be tracked by the book",
+                    );
+                    match stop_order.type_ {
+                        order::Type::Stop => {
+                            stop_order.type_ = order::Type::Market;
+                            stop_order.price = match stop_order.slippage() {
+                                Some(slippage) => best_bid_price.plus_slippage(slippage),
+                                None => *self.bids.worst_price().expect("invariant violated: if there is best ask price, then there is a worst ask price"),
+                            };
+                        }
+                        order::Type::StopLimit => {
+                            stop_order.type_ = order::Type::Limit;
+                        }
+                        other => {
+                            unimplemented!("only stop orders can be activated; got `{other:?}`")
+                        }
+                    }
+
+                    let events_before = log.events.len();
+                    if stop_order.needs_full_execution()
+                        && !self.bids.has_enough_volume_at_price_or_better(
+                            stop_order.price(),
+                            stop_order.quantity(),
+                        )
+                    {
+                        // TODO: stop execution here. In the high level match loop this generates an error, which we can't and don't want to do here..
+                        // It should probably not produce an error and instead add a new event to the log.
+                    } else {
+                        'level_loop: for (_current_price, level) in self.bids.iter_levels() {
+                            if stop_order.is_filled() || !level.is_crossed_by_order(&stop_order) {
+                                break 'level_loop;
+                            }
+                            level.match_order(&mut stop_order, log);
+                        }
+                        self.bids.drop_empty_levels();
+                    }
+
+                    // Clear those orders from the book that have been filled during the last match.
+                    for event in &log.events[events_before..] {
+                        if let transaction::Event::MakerFilled(transaction::Filled { id, .. }) =
+                            event
+                        {
+                            let _old = self.id_to_side_and_price.remove(id);
+                            crate::debug_assert_some!(_old);
+                        }
+                    }
+                    if stop_order.is_filled() {
+                        log.push(transaction::Event::TakerFilled(transaction::Filled {
+                            id: *stop_order.id(),
+                            side: *stop_order.side(),
+                        }));
+                    } else if !stop_order.is_immediate() {
+                        log.push(transaction::Event::Added(stop_order.clone()));
+                        self.id_to_side_and_price.insert(*stop_order.id(), (*stop_order.side(), *stop_order.type_(), *stop_order.price()))
+                            .expect("invariant violated: at the beginning of the loop we have removed this order from the book, and so it must not exist in the map");
+                        activation.add_order_unchecked(stop_order);
+                    }
+                }
+            }
+
+            if have_activations_happened_on_iteration {
+                break 'activation;
+            }
+        }
+    }
+
+    /// Run a full match loop over the entire orderbook.
+    ///
+    /// After it ran, this method ensures that all orders on the book that crossed the
+    /// market price are executed, and that stop orders that have crossed the market price are
+    /// activated (and executed, if needed).
+    fn perform_full_match(&mut self, log: &mut transaction::Log) {
+        'full_match: loop {
+            let mut match_happened = false;
+            // first, execute all bids
+            'match_bids: {
+                let Some(best_ask_price) = self.asks.best_price().copied() else {
+                    break 'match_bids;
+                };
+                'loop_bids: for (bid_price, bid_level) in &mut self.bids.levels {
+                    if bid_price.as_ref() < &best_ask_price {
+                        break 'loop_bids;
+                    }
+                    let events_before = log.events.len();
+                    // match every single bid to all asks
+                    for bid in &mut bid_level.inner {
+                        'match_single_bid: for (_, ask_level) in self.asks.levels.iter_mut() {
+                            if bid.is_filled() || ask_level.is_crossed_by_order(bid) {
+                                break 'match_single_bid;
+                            }
+                            ask_level.match_order(bid, log);
+                        }
+                    }
+                    // a second pass to remove filled bids is necessary because the iterator in the
+                    // previous loop needs to be stable
+                    bid_level.inner.retain(|order| {
+                        if order.is_filled() {
+                            log.push(transaction::Event::MakerFilled(transaction::Filled {
+                                id: *order.id(),
+                                side: *order.side(),
+                            }));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    for event in &log.events[events_before..] {
+                        if let transaction::Event::MakerFilled(transaction::Filled { id, .. })
+                        | transaction::Event::TakerFilled(transaction::Filled { id, .. }) = event
+                        {
+                            let _old = self.id_to_side_and_price.remove(id);
+                            crate::debug_assert_some!(_old);
+                        }
+                    }
+                    // We use the events logged as a proxy to determine if matches happened.
+                    match_happened |= log.events.len() > events_before;
+                }
+
+                self.bids.drop_empty_levels();
+            }
+
+            // then, execute all asks
+            // TODO: streamline both of these loops to avoid all that duplicate logic.
+            'match_asks: {
+                let Some(best_bid_price) = self.bids.best_price().copied() else {
+                    break 'match_asks;
+                };
+                'loop_bids: for (ask_price, ask_level) in &mut self.asks.levels {
+                    if ask_price.as_ref() > &best_bid_price {
+                        break 'loop_bids;
+                    }
+                    let events_before = log.events.len();
+                    // match every single bid to all asks
+                    for ask in &mut ask_level.inner {
+                        'match_single_ask: for (_, bid_level) in self.bids.levels.iter_mut() {
+                            if ask.is_filled() || bid_level.is_crossed_by_order(ask) {
+                                break 'match_single_ask;
+                            }
+                            bid_level.match_order(ask, log);
+                        }
+                    }
+                    // a second pass to remove filled bids is necessary because the iterator in the
+                    // previous loop needs to be stable
+                    ask_level.inner.retain(|order| {
+                        if order.is_filled() {
+                            log.push(transaction::Event::MakerFilled(transaction::Filled {
+                                id: *order.id(),
+                                side: *order.side(),
+                            }));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    for event in &log.events[events_before..] {
+                        if let transaction::Event::MakerFilled(transaction::Filled { id, .. })
+                        | transaction::Event::TakerFilled(transaction::Filled { id, .. }) = event
+                        {
+                            let _old = self.id_to_side_and_price.remove(id);
+                            crate::debug_assert_some!(_old);
+                        }
+                    }
+                    // We use the events logged as a proxy to determine if matches happened.
+                    match_happened |= log.events.len() > events_before;
+                }
+
+                self.bids.drop_empty_levels();
+            }
+
+            let events_before = log.events.len();
+            self.activate_stop_orders(log);
+            match_happened |= log.events.len() > events_before;
+
+            if match_happened {
+                break 'full_match;
+            }
         }
     }
 

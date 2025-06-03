@@ -24,10 +24,10 @@ pub enum Event {
     /// An order that was added to the orderbook.
     Added(order::Order),
     /// An maker order that has been filled and is subsequently removed from the orderbook.
-    MakerFilled(MakerFilled),
+    MakerFilled(Filled),
     /// A taker order that has been filled. These never make it to the orderbook.
     // TODO: it might make sense to keep this in the `Log`?
-    TakerFilled { id: order::Id, side: order::Side },
+    TakerFilled(Filled),
     Match {
         /// The ID of the order that triggered a match, i.e. the order that is being filled by
         /// the passive order.
@@ -41,7 +41,7 @@ pub enum Event {
     },
 }
 
-pub struct MakerFilled {
+pub struct Filled {
     pub id: order::Id,
     pub side: order::Side,
 }
