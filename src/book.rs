@@ -358,6 +358,36 @@ where
             .map(|(price, level)| (price.as_ref(), level))
     }
 
+    /// Sets the price of the market `order`.
+    ///
+    /// If `order` has slippage configured, then its price will be set to
+    /// the best price plus/minus slippage (if the halfbook tracks asks, then
+    /// slippage is added; if the halfbook tracks bids, then slippage is subtracted).
+    ///
+    /// The caller of this function has to ensure that `order` is a market order and
+    /// that it is on the correct side.
+    ///
+    /// This method will set the order's price and not ensure that it is legal to do so.
+    fn set_market_order_price(&self, order: &mut order::Order) {
+        debug_assert_eq!(self.side, order.side().opposite());
+        debug_assert_eq!(order.type_(), &order::Type::Market);
+
+        order.price = if let Some(slippage) = order.slippage() {
+            let Some(best_price) = self.best_price() else {
+                return;
+            };
+            match self.side {
+                order::Side::Ask => best_price.plus_slippage(slippage),
+                order::Side::Bid => best_price.minus_slippage(slippage),
+            }
+        } else {
+            let Some(worst_price) = self.worst_price() else {
+                return;
+            };
+            *worst_price
+        };
+    }
+
     // Returns the best price stored in the halfbook.
     //
     // Depending on how it's parameterized, this is either the highest ask price or the lowest bid price.
@@ -479,6 +509,8 @@ where
     ///
     /// Panics if an order with the same ID already exists in the halfbook.
     fn add_order_unchecked(&mut self, order: order::Order) {
+        debug_assert_eq!(self.side, order.side().opposite());
+
         // TODO: What are reasonable default sizes for the preallocated buffers?
         let level = match order.type_() {
             order::Type::Limit => self
@@ -753,7 +785,7 @@ impl Book {
         }
     }
 
-    fn get_worst_price(&self, side: &order::Side) -> Option<&Price> {
+    fn worst_price(&self, side: &order::Side) -> Option<&Price> {
         match side {
             order::Side::Ask => self.asks.worst_price(),
             order::Side::Bid => self.bids.worst_price(),
@@ -801,10 +833,7 @@ impl Book {
                     match stop_order.type_ {
                         order::Type::Stop => {
                             stop_order.type_ = order::Type::Market;
-                            stop_order.price = match stop_order.slippage() {
-                                Some(slippage) => best_ask_price.minus_slippage(slippage),
-                                None => *self.asks.worst_price().expect("invariant violated: if there is best ask price, then there is a worst ask price"),
-                            };
+                            self.asks.set_market_order_price(&mut stop_order);
                         }
                         order::Type::StopLimit => {
                             stop_order.type_ = order::Type::Limit;
@@ -872,10 +901,7 @@ impl Book {
                     match stop_order.type_ {
                         order::Type::Stop => {
                             stop_order.type_ = order::Type::Market;
-                            stop_order.price = match stop_order.slippage() {
-                                Some(slippage) => best_bid_price.plus_slippage(slippage),
-                                None => *self.bids.worst_price().expect("invariant violated: if there is best ask price, then there is a worst ask price"),
-                            };
+                            self.bids.set_market_order_price(&mut stop_order);
                         }
                         order::Type::StopLimit => {
                             stop_order.type_ = order::Type::Limit;
@@ -1055,30 +1081,12 @@ impl Book {
     /// matched against).
     ///
     /// NOTE: if no price (best or worst) can be established for the order book the
-    /// price will be left unchanged. Since
-    fn set_market_order_price(&mut self, order: &mut order::Order) {
-        // XXX: If there are no prices in the order book then the field is left unchanged.
-        //
-        // This does not matter because the subsequent and immediate match will yield no
-        // matches.
-        let market_price = match order.slippage() {
-            Some(slippage) => {
-                let Some(best_price) = self.best_price(&order.side().opposite()) else {
-                    return;
-                };
-                match order.side() {
-                    order::Side::Ask => best_price.plus_slippage(slippage),
-                    order::Side::Bid => best_price.minus_slippage(slippage),
-                }
-            }
-            None => {
-                let Some(worst_price) = self.get_worst_price(&order.side().opposite()) else {
-                    return;
-                };
-                *worst_price
-            }
-        };
-        order.price = market_price;
+    /// price will be left unchanged.
+    fn set_market_order_price(&self, order: &mut order::Order) {
+        match order.side() {
+            order::Side::Ask => self.bids.set_market_order_price(order),
+            order::Side::Bid => self.asks.set_market_order_price(order),
+        }
     }
 }
 
