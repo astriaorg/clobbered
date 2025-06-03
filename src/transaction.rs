@@ -24,13 +24,17 @@ pub enum Event {
     /// An order that was added to the orderbook.
     Added(order::Order),
     /// An order that has been fully executed and, if it was on the orderbook, removed from the orderbook.
-    Filled { id: order::Id, side: order::Side },
+    Remove {
+        id: order::Id,
+        side: order::Side,
+        unfilled_quantity: order::Quantity,
+    },
     Match {
         /// The ID of the order that triggered a match, i.e. the order that is being filled by
         /// the passive order.
-        taker_order_id: crate::order::Id,
+        active_order_id: crate::order::Id,
         /// The ID of the order in the orderbook that is filling the active order.
-        maker_order_id: crate::order::Id,
+        passive_order_id: crate::order::Id,
         /// The price at which the transaction occured.
         price: crate::order::Price,
         /// The quantity that was exchanged.
