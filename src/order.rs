@@ -8,8 +8,22 @@ pub struct Price(u128);
 
 impl Price {
     /// Constructs a new price.
-    pub fn new(value: u128) -> Self {
+    pub const fn new(value: u128) -> Self {
         Self(value)
+    }
+
+    /// Returns the maximum possible price.
+    ///
+    /// This is useful when used in lieu of the best possible bid/worst possible ask price.
+    pub const fn max() -> Self {
+        Self::new(u128::MAX)
+    }
+
+    /// Returns the lowest possible price/zero.
+    ///
+    /// This is useful when used in lieu of the worst possible bid/best possible ask price.
+    pub const fn zero() -> Self {
+        Self::new(u128::MAX)
     }
 
     /// Calculates the price plus slippage.
@@ -49,6 +63,12 @@ impl Price {
             Side::Ask => self <= other,
             Side::Bid => self >= other,
         }
+    }
+}
+
+impl AsRef<Price> for Price {
+    fn as_ref(&self) -> &Price {
+        self
     }
 }
 
@@ -300,6 +320,42 @@ impl Order {
     /// Returns if the order is a stop order.
     pub fn is_stop(&self) -> bool {
         matches!(self.type_, Type::Stop | Type::StopLimit,)
+    }
+
+    /// Sets the market price of the order, taking into accounts its side and slippage setting.
+    ///
+    /// If the order does not have slippage set, then its market price will be set to the maximum
+    /// possible value (maximum if a bid, minimum if an ask). If it has slippage set, then its
+    /// market price will be set to `market_price +/- slippage` (the slippage is added if a bid,
+    /// subtracted if an ask).
+    ///
+    /// The caller is responsible for ensuring that the order is indeed a market order because
+    /// this call otherwise does not make sense.
+    pub fn set_market_price_considering_slippage(&mut self, market_price: &Price) {
+        let order_price = if let Some(slippage) = self.slippage {
+            match self.side {
+                Side::Ask => market_price.minus_slippage(&slippage),
+                Side::Bid => market_price.plus_slippage(&slippage),
+            }
+        } else {
+            match self.side {
+                Side::Ask => Price::zero(),
+                Side::Bid => Price::max(),
+            }
+        };
+        self.price = order_price;
+    }
+
+    /// Returns if the order has slippage set.
+    pub fn has_slippage(&self) -> bool {
+        self.slippage.is_some()
+    }
+
+    /// Returns if the order has volume, that is if its quantity is not zero.
+    ///
+    /// This is the inerse of [`Order::is_filled`].
+    pub fn has_volume(&self) -> bool {
+        self.quantity != Quantity::zero()
     }
 
     pub fn needs_full_execution(&self) -> bool {

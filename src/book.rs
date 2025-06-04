@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     order::{self, Price},
@@ -8,6 +8,174 @@ use crate::{
 #[derive(Debug, PartialEq, Eq)]
 pub enum AddOrderError {
     IdAlreadyExists(order::Order),
+}
+
+#[derive(Debug)]
+struct PriceToLevel<TPrice> {
+    side: order::Side,
+    inner: BTreeMap<TPrice, Level>,
+}
+
+impl<TPrice> PriceToLevel<TPrice> {
+    fn new(side: order::Side) -> Self {
+        Self {
+            side,
+            inner: BTreeMap::new(),
+        }
+    }
+}
+
+impl<TPrice> PriceToLevel<TPrice>
+where
+    TPrice: Ord,
+{
+    fn best_price(&self) -> Option<&TPrice> {
+        self.inner.first_key_value().map(|(price, _)| price)
+    }
+}
+
+impl<TPrice> PriceToLevel<TPrice>
+where
+    TPrice: HasSide + Ord,
+{
+    fn is_crossed_by(&self, order: &order::Order) -> bool {
+        debug_assert_eq!(self.side, order.side().opposite());
+        if let Some(best_price) = self.inner.first_key_value().map(|(price, _)| price) {
+            let order_price = if order.is_stop() {
+                order.stop_price()
+            } else {
+                order.price()
+            };
+            best_price.is_worse_than(order_price)
+        } else {
+            false
+        }
+    }
+}
+
+impl<TPrice> PriceToLevel<TPrice>
+where
+    TPrice: From<order::Price> + Ord,
+{
+    fn cancel_order(&mut self, id: &order::Id, price: &TPrice) {
+        let level = self
+            .inner
+            .get_mut(price)
+            .expect("invariant violated: `price` passed down from Half must map to a level");
+        level.cancel(id);
+    }
+
+    /// Inserts an order in the price-to-level map.
+    ///
+    /// Panics if the order is a market order.
+    fn insert_order(&mut self, order: order::Order) {
+        debug_assert_eq!(self.side, order.side);
+        debug_assert!(
+            order.has_volume(),
+            "empty orders should not be stored in the halfbook"
+        );
+
+        let level = match order.type_() {
+            order::Type::Market => {
+                unimplemented!("market orders must not be stored in the halfbook")
+            }
+            _all_others => self
+                .inner
+                .entry(TPrice::from(*order.price()))
+                .or_insert_with(|| Level::new(*order.price(), self.side)),
+        };
+        level.push(order);
+    }
+}
+
+impl<TPrice> PriceToLevel<TPrice>
+where
+    TPrice: Ord + HasSide,
+{
+    /// Checks if the halfbook has enough volume at `price` or better to fill the `requested` amount.
+    fn has_enough_volume_at_price_or_better(
+        &self,
+        price: &order::Price,
+        requested: &order::Quantity,
+    ) -> bool {
+        let mut still_needed = *requested;
+        'levels: for (level_price, level) in self.levels() {
+            if level_price.is_worse_than(price) {
+                break 'levels;
+            }
+            for order in level.orders() {
+                if order.needs_full_execution() {
+                    if &still_needed >= order.quantity() {
+                        still_needed = still_needed.saturating_sub(order.quantity());
+                    }
+                } else {
+                    still_needed = still_needed.saturating_sub(order.quantity());
+                }
+
+                // shortcircuit so that this iterator does not keep walking the underlying btree.
+                //
+                // TODO: check if this is actually cache efficient. might also need revisiting if
+                // the underlying datastructure changes.
+                if still_needed.is_zero() {
+                    break 'levels;
+                }
+            }
+        }
+        still_needed.is_zero()
+    }
+}
+
+impl<TPrice> PriceToLevel<TPrice>
+where
+    TPrice: Ord,
+{
+    /// Clears levels of orders with zero volume and removes levels with no volume.
+    fn clean_levels_and_drop_empty(&mut self) {
+        // TODO: this might be an avenue for improvement by doing a better job at tracking
+        // the "holes"/orders with no volume.
+        self.inner.retain(|_, level| {
+            level.drop_filled_orders();
+            level.has_volume()
+        });
+    }
+
+    /// Checks if the halfbook has enough volume to fill the `requested` amount.
+    fn has_enough_volume(&self, requested: &order::Quantity) -> bool {
+        let mut still_needed = *requested;
+        'levels: for (_price, level) in self.levels() {
+            for order in level.orders() {
+                if order.needs_full_execution() {
+                    if &still_needed >= order.quantity() {
+                        still_needed = still_needed.saturating_sub(order.quantity());
+                    }
+                } else {
+                    still_needed = still_needed.saturating_sub(order.quantity());
+                }
+
+                // shortcircuit so that this iterator does not keep walking the underlying btree.
+                //
+                // TODO: check if this is actually cache efficient. might also need revisiting if
+                // the underlying datastructure changes.
+                if still_needed.is_zero() {
+                    break 'levels;
+                }
+            }
+        }
+        still_needed.is_zero()
+    }
+    /// Crates an iterator over the levels of the this map.
+    ///
+    /// The levels are from best to worst (ascending if ask, descending if bid).
+    fn levels(&self) -> impl Iterator<Item = (&TPrice, &Level)> {
+        self.inner.iter()
+    }
+
+    /// Crates an iterator over the mutable levels of the this map.
+    ///
+    /// The levels are from best to worst (ascending if ask, descending if bid).
+    fn levels_mut(&mut self) -> impl Iterator<Item = (&TPrice, &mut Level)> {
+        self.inner.iter_mut()
+    }
 }
 
 /// A price-level of the orderbook.
@@ -28,7 +196,7 @@ struct Level {
     /// TODO: investigate if this should be replaced by a BTreeSet
     /// or Vec or VecDeque (or even IndexMap). All depends on the optimal performance
     /// for the different operations.
-    inner: VecDeque<order::Order>,
+    inner: Vec<order::Order>,
 }
 
 impl Level {
@@ -39,19 +207,15 @@ impl Level {
             // TODO: What's an optimal pre-allocated size for the deque?
             // Either way, we should probably think about using some kind of
             // arena anyway.
-            inner: VecDeque::new(),
+            inner: Vec::with_capacity(1024),
         }
-    }
-
-    fn price(&self) -> &Price {
-        &self.price
     }
 
     /// Returns if the level has any makers.
     ///
-    /// This function relies on empty orders being removed from the level.
-    /// If orders with zero quantity are added to the level then this method
-    /// will become meaningless.
+    /// This function relies on empty orders having been removed from the level via
+    /// [`Self::drop_empty_orders`]. If this operation has not been performed then
+    /// the output of this function is meaningless.
     fn has_volume(&self) -> bool {
         !self.inner.is_empty()
     }
@@ -80,39 +244,24 @@ impl Level {
         }
     }
 
-    fn pop(&mut self) -> Option<order::Order> {
-        self.inner.pop_front()
-    }
+    // fn pop(&mut self) -> Option<order::Order> {
+    //     self.inner.pop_front()
+    // }
 
     /// Pushes a new order to the back of the level.
     fn push(&mut self, order: order::Order) {
         debug_assert_eq!(&self.side, order.side());
-        self.inner.push_back(order);
+        self.inner.push(order);
     }
 
-    fn remove_order(&mut self, id: &order::Id) -> Option<order::Order> {
-        let idx = self.inner.iter().position(|order| &order.id == id)?;
-        let order = self.inner.remove(idx);
-        debug_assert!(order.is_some());
-        order
-    }
-
-    /// Calculates the total volume at this level.
-    ///
-    /// Note that this quantity saturates at the maximum of the type
-    /// underlying [`order::Quantity`]. It is assumed that [`Self::volume`]
-    /// is used to check if there is enough volume available to fill
-    /// an order. Since the order can only request up to [`order::Quantity`]
-    /// saturating at its maximum is fine.
-    fn calculate_volume(&self) -> order::Quantity {
-        let (left, right) = self.inner.as_slices();
-        left.iter()
-            .fold(order::Quantity::zero(), |acc, order| {
-                acc.saturating_add(order.quantity())
-            })
-            .saturating_add(&right.iter().fold(order::Quantity::zero(), |acc, order| {
-                acc.saturating_add(order.quantity())
-            }))
+    /// Cancels the order identified by `id`.
+    fn cancel(&mut self, id: &order::Id) {
+        for order in &mut self.inner {
+            if order.id() == id {
+                order.quantity = order::Quantity::zero();
+                return;
+            }
+        }
     }
 
     /// Matches a taker [`order`] to the orders at this price level.
@@ -126,7 +275,8 @@ impl Level {
     ) where
         FOnRemove: FnMut(&order::Order),
     {
-        'match_loop: for maker in &mut self.inner {
+        let level_price = self.price;
+        'match_loop: for maker in &mut self.orders_mut() {
             let mut quantity = order::Quantity::zero();
             if taker.quantity() >= maker.quantity() {
                 quantity = taker.quantity().saturating_sub(maker.quantity());
@@ -144,40 +294,49 @@ impl Level {
                 log.push(transaction::Event::Match {
                     active_order_id: *taker.id(),
                     passive_order_id: *maker.id(),
-                    price: self.price,
+                    price: level_price,
                     quantity,
                 });
             }
+
+            if maker.is_filled() {
+                on_remove(maker);
+                log.push(transaction::Event::Remove {
+                    id: *maker.id(),
+                    side: *maker.side(),
+                    unfilled_quantity: order::Quantity::zero(),
+                });
+            }
+
             if taker.is_filled() {
                 break 'match_loop;
             }
         }
-
-        // The second pass over the level is needed to remove all orders with zero quantity.
-        // Unfortunately this is necessary because an iterator needs to be stable during iteration.
-        // With vec-deques there is no way to pop-check-push-next.
-        self.inner.retain(|order| {
-            if order.is_filled() {
-                on_remove(order);
-                log.push(transaction::Event::Remove {
-                    id: *order.id(),
-                    side: *order.side(),
-                    unfilled_quantity: order::Quantity::zero(),
-                });
-                false
-            } else {
-                true
-            }
-        });
     }
 
     /// Returns an iterator over the orders at this level.
     fn orders(&self) -> impl Iterator<Item = &order::Order> {
-        self.inner.iter()
+        self.inner.iter().filter(|ord| ord.has_volume())
+    }
+
+    /// Returns an iterator over the orders at this level.
+    fn orders_mut(&mut self) -> impl Iterator<Item = &mut order::Order> {
+        self.inner.iter_mut().filter(|ord| ord.has_volume())
+    }
+
+    /// Drains the orders from this level, leaving it empty.
+    fn drain_orders(&mut self) -> impl Iterator<Item = order::Order> {
+        self.inner.drain(..).filter(|order| order.has_volume())
+    }
+
+    /// Removes orders from the level that have no volume and keeps those that do.
+    fn drop_filled_orders(&mut self) {
+        self.inner.retain(|order| order.has_volume())
     }
 }
+
 /// Ask prices. Used for ordering prices in ascending order.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct AskPrice(Price);
 
 impl Ord for AskPrice {
@@ -194,7 +353,7 @@ impl PartialOrd for AskPrice {
 }
 
 /// Bid prices. Used for ordering prices in descending order.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct BidPrice(Price);
 
 impl Ord for BidPrice {
@@ -249,17 +408,45 @@ impl From<BidPrice> for Price {
 
 trait HasSide {
     fn side() -> order::Side;
+
+    fn worst_possible() -> Self;
+
+    fn is_worse_than<P>(&self, price: P) -> bool
+    where
+        P: AsRef<Price>;
 }
 
 impl HasSide for AskPrice {
     fn side() -> order::Side {
         order::Side::Ask
     }
+
+    fn worst_possible() -> Self {
+        Self::from(order::Price::max())
+    }
+
+    fn is_worse_than<P>(&self, price: P) -> bool
+    where
+        P: AsRef<Price>,
+    {
+        self.as_ref() > price.as_ref()
+    }
 }
 
 impl HasSide for BidPrice {
     fn side() -> order::Side {
         order::Side::Bid
+    }
+
+    fn worst_possible() -> Self {
+        Self::from(order::Price::zero())
+    }
+
+    fn is_worse_than<P>(&self, price: P) -> bool
+    where
+        P: AsRef<Price>,
+    {
+        self.as_ref() < price.as_ref()
     }
 }
 
@@ -276,12 +463,12 @@ struct Half<TPrice> {
     ///
     /// Prices are indices into the map, with the
     /// levels themselves keeping a time-ordering.
-    levels: BTreeMap<TPrice, Level>,
+    levels: PriceToLevel<TPrice>,
     /// Price-time levels of stop and stop-limit orders in the halfbook that
     /// are waiting to be activated.
     ///
     /// These are ordered by the price at which they would activate.
-    stop_orders: BTreeMap<TPrice, Level>,
+    stop_orders: PriceToLevel<TPrice>,
 }
 
 impl<TPrice> Half<TPrice>
@@ -292,15 +479,15 @@ where
     fn new() -> Self {
         Self {
             side: TPrice::side(),
-            levels: BTreeMap::new(),
-            stop_orders: BTreeMap::new(),
+            levels: PriceToLevel::new(TPrice::side()),
+            stop_orders: PriceToLevel::new(TPrice::side()),
         }
     }
 }
 
 impl<TPrice> Half<TPrice>
 where
-    TPrice: Ord,
+    TPrice: From<Price> + Ord,
 {
     /// Cancels an order identified by its `id` and returns it.
     ///
@@ -310,40 +497,48 @@ where
     /// This method is supposed to only be called from [`Book`], which
     /// enforces these invariants.
     // TODO: Can we use borrow semantics to borrow P as TPrice instead?
-    fn cancel<P: Into<TPrice>>(
-        &mut self,
-        id: &order::Id,
-        type_: &order::Type,
-        price: P,
-    ) -> order::Order {
-        let level = match type_ {
-            order::Type::Limit => self
-                .levels
-                .get_mut(&price.into())
-                .expect("invariant violated: `price` passed down from Book must map to a level"),
-            order::Type::Stop | order::Type::StopLimit => self
-                .stop_orders
-                .get_mut(&price.into())
-                .expect("invariant violated: `price` passed down from Book must map to a level"),
+    fn cancel(&mut self, id: &order::Id, type_: &order::Type, price: &order::Price) {
+        match type_ {
+            order::Type::Limit => self.levels.cancel_order(id, &TPrice::from(*price)),
+            order::Type::Stop | order::Type::StopLimit => {
+                self.stop_orders.cancel_order(id, &TPrice::from(*price))
+            }
 
             order::Type::Market => {
                 unimplemented!("market orders must not be stored in the halfbook")
             }
         };
-        level
-            .remove_order(id)
-            .expect("invariant violated: `id` passed down from Book must exist at this level")
     }
 
     fn drop_empty_levels(&mut self) {
-        self.levels.retain(|_, level| level.has_volume());
+        self.levels.clean_levels_and_drop_empty();
+    }
+
+    fn drop_empty_stop_order_levels(&mut self) {
+        self.stop_orders.clean_levels_and_drop_empty();
     }
 }
 
 impl<TPrice> Half<TPrice>
 where
-    TPrice: AsRef<Price> + From<Price> + Ord,
+    TPrice: AsRef<Price> + Copy + From<Price> + HasSide + Ord,
 {
+    /// Executes `order` against the boo.
+    ///
+    /// If `order` is a stop order, then this method will
+    /// also convert it to an executable order (market, limit, etc),
+    /// and set its price to the market price.
+    ///
+    /// This will leave the halfbook in a "dirty" state, potentially
+    /// containing levels with no volume.
+    ///
+    /// This method will generate events for all order that are affected
+    /// by this process on its side (specifically match and removal).
+    ///
+    /// It will not generate events that only affect `order`.
+    ///
+    /// Run [`Half::drop_empty_levels`] to explicitly remove levels
+    /// with no volume.
     fn perform_match<FOnRemove>(
         &mut self,
         order: &mut order::Order,
@@ -352,8 +547,35 @@ where
     ) where
         FOnRemove: FnMut(&order::Order),
     {
+        debug_assert_eq!(self.side, order.side().opposite());
+
+        // XXX: use the worst possible price here to line up the types.
+        // In practice this won't do anything because if there is no
+        // best price then there are no orders to match against.
+        let mut market_price = *self
+            .best_price()
+            .copied()
+            .unwrap_or_else(TPrice::worst_possible)
+            .as_ref();
+
+        // Performs the conversion of stop order to executable order.
+        match order.type_ {
+            order::Type::Stop => {
+                order.type_ = order::Type::Market;
+                if order.has_slippage() {
+                    market_price = *order.stop_price();
+                } else {
+                    market_price = *TPrice::worst_possible().as_ref();
+                }
+            }
+            order::Type::StopLimit => {
+                order.type_ = order::Type::Limit;
+            }
+            _ => {}
+        }
+
         if order.is_market() {
-            self.set_market_order_price(order);
+            order.set_market_price_considering_slippage(&market_price);
         }
 
         if order.needs_full_execution()
@@ -362,14 +584,12 @@ where
             return;
         }
 
-        'level_loop: for (_current_price, level) in self.iter_levels() {
+        'level_loop: for (_current_price, level) in self.levels.levels_mut() {
             if order.is_filled() || !level.is_crossed_by_order(order) {
                 break 'level_loop;
             }
             level.match_order(order, log, &mut on_remove);
         }
-
-        self.drop_empty_levels();
     }
 }
 
@@ -380,163 +600,43 @@ where
     // Returns the best price stored in the halfbook.
     //
     // Depending on how it's parameterized, this is either the lowest ask price or the highest bid price.
-    fn best_price(&self) -> Option<&Price> {
-        self.levels
-            .first_key_value()
-            .map(|(price, _)| price.as_ref())
-    }
-
-    // Returns the best price level in the halfbook.
-    //
-    // Depending on how it's parameterized, this is either the lowest ask price or the highest bid price.
-    fn best_price_level(&self) -> Option<&Level> {
-        self.levels.first_key_value().map(|(_, level)| level)
-    }
-
-    fn iter_levels(&mut self) -> impl Iterator<Item = (&Price, &mut Level)> {
-        self.levels
-            .iter_mut()
-            .map(|(price, level)| (price.as_ref(), level))
-    }
-
-    /// Sets the price of the market `order`.
-    ///
-    /// If `order` has slippage configured, then its price will be set to
-    /// the best price plus/minus slippage (if the halfbook tracks asks, then
-    /// slippage is added; if the halfbook tracks bids, then slippage is subtracted).
-    ///
-    /// The caller of this function has to ensure that `order` is a market order and
-    /// that it is on the same side as the halfbook.
-    fn set_market_order_price(&self, order: &mut order::Order) {
-        debug_assert_eq!(self.side, order.side().opposite());
-        debug_assert_eq!(order.type_(), &order::Type::Market);
-
-        order.price = if let Some(slippage) = order.slippage() {
-            let Some(best_price) = self.best_price() else {
-                return;
-            };
-            match self.side {
-                order::Side::Ask => best_price.plus_slippage(slippage),
-                order::Side::Bid => best_price.minus_slippage(slippage),
-            }
-        } else {
-            let Some(worst_price) = self.worst_price() else {
-                return;
-            };
-            *worst_price
-        };
-    }
-
-    // Returns the best price stored in the halfbook.
-    //
-    // Depending on how it's parameterized, this is either the highest ask price or the lowest bid price.
-    fn worst_price(&self) -> Option<&Price> {
-        self.levels
-            .last_key_value()
-            .map(|(price, _)| price.as_ref())
-    }
-}
-
-struct ActivateStopOrders<'book, TPrice> {
-    side: order::Side,
-    halfbook: &'book mut Half<TPrice>,
-    draining_level: Option<Level>,
-    reference_price: TPrice,
-}
-
-impl<'book, TPrice> ActivateStopOrders<'book, TPrice>
-where
-    TPrice: Ord,
-{
-    fn next_activating_order(&mut self) -> Option<order::Order> {
-        loop {
-            if let Some(order) = self.draining_level.as_mut().and_then(Level::pop) {
-                return Some(order);
-            };
-
-            // XXX: remember that TPrice has different PartialOrd implementations depending on which
-            // level we are at: ask prices are ordered in ascending order (like regular integers),
-            // whiile bid prices are in descending order, which means that bid.price_1 < bid.price_2
-            // evaluates to true bid.price_1 is *greater* than bid.price_2.
-            //
-            // NOTE: the ? operator is responsible for breaking loop (easily overlooked).
-            if self.halfbook.stop_orders.first_key_value()?.0 <= &self.reference_price {
-                self.draining_level = self
-                    .halfbook
-                    .stop_orders
-                    .pop_first()
-                    .map(|(_price, level)| level);
-            }
-        }
-    }
-}
-
-impl<'book, TPrice> ActivateStopOrders<'book, TPrice>
-where
-    TPrice: From<Price> + Ord + std::fmt::Debug,
-{
-    /// Adds an order to the halfbook.
-    ///
-    /// Panics if an order with the same ID already exists in the halfbook.
-    fn add_order_unchecked(&mut self, order: order::Order) {
-        self.halfbook.add_order_unchecked(order);
+    fn best_price(&self) -> Option<&TPrice> {
+        self.levels.best_price()
     }
 }
 
 impl<TPrice> Half<TPrice>
 where
-    TPrice: From<Price> + Ord,
+    TPrice: HasSide + Ord,
 {
-    /// Starts the process of activating stop orders in the halfbook.
-    fn start_activate_stop_orders(&mut self, price: &Price) -> ActivateStopOrders<'_, TPrice> {
-        ActivateStopOrders {
-            side: self.side,
-            halfbook: self,
-            draining_level: None,
-            reference_price: TPrice::from(*price),
-        }
+    fn is_crossed_by(&self, order: &order::Order) -> bool {
+        debug_assert_eq!(self.side, order.side().opposite());
+        self.levels.is_crossed_by(order)
     }
+}
 
+impl<TPrice> Half<TPrice>
+where
+    TPrice: Ord,
+{
+    /// Checks if the halfbook has enough volume to fill the `requested` amount.
     fn has_enough_volume(&self, requested: &order::Quantity) -> bool {
-        let mut vol = order::Quantity::zero();
-
-        for level in self.levels.values() {
-            vol = vol.saturating_add(&level.calculate_volume());
-            // shortcircuit so that this iterator does not keep walking the underlying btree.
-            //
-            // TODO: check if this is actually cache efficient. might also need revisiting if
-            // the underlying datastructure changes.
-            if &vol >= requested {
-                return true;
-            }
-        }
-        &vol >= requested
+        self.levels.has_enough_volume(requested)
     }
+}
 
+impl<TPrice> Half<TPrice>
+where
+    TPrice: Ord + HasSide,
+{
     /// Checks if the halfbook has enough volume at `price` or better to fill the `requested` amount.
     fn has_enough_volume_at_price_or_better(
         &self,
         price: &Price,
         requested: &order::Quantity,
     ) -> bool {
-        let mut still_needed = *requested;
-        for (_price, level) in self.levels.range(..=TPrice::from(*price)) {
-            for order in level.orders() {
-                if order.needs_full_execution() {
-                    // Only consider the volume of this maker order if it could executed in full, skip otherwise.
-                    if &still_needed >= order.quantity() {
-                        still_needed = still_needed.saturating_sub(order.quantity());
-                    }
-                } else {
-                    still_needed = still_needed.saturating_sub(order.quantity());
-                }
-                // short-circuit so that this iterator does not keep walking the full btree.
-                if still_needed.is_zero() {
-                    return true;
-                }
-            }
-        }
-        still_needed.is_zero()
+        self.levels
+            .has_enough_volume_at_price_or_better(price, requested)
     }
 }
 
@@ -545,79 +645,17 @@ where
     TPrice: From<Price> + Ord + std::fmt::Debug,
 {
     /// Adds an order to the halfbook.
-    ///
-    /// Panics if an order with the same ID already exists in the halfbook.
     fn add_order_unchecked(&mut self, order: order::Order) {
         debug_assert_eq!(self.side, order.side().opposite());
 
         // TODO: What are reasonable default sizes for the preallocated buffers?
-        let level = match order.type_() {
-            order::Type::Limit => self
-                .levels
-                .entry(TPrice::from(*order.price()))
-                .or_insert_with(|| Level::new(*order.price(), self.side)),
-            order::Type::Stop | order::Type::StopLimit => self
-                .stop_orders
-                .entry(TPrice::from(*order.stop_price()))
-                .or_insert_with(|| Level::new(*order.stop_price(), self.side)),
+        match order.type_() {
+            order::Type::Limit => self.levels.insert_order(order),
+            order::Type::Stop | order::Type::StopLimit => self.stop_orders.insert_order(order),
             order::Type::Market => {
                 unimplemented!("market orders must not be stored in the halfbook")
             }
         };
-        level.push(order);
-    }
-}
-
-struct BestPricesIter__<'book, TPrice> {
-    iter: std::collections::btree_map::IterMut<'book, TPrice, Level>,
-}
-
-impl<'book, TPrice> Iterator for BestPricesIter__<'book, TPrice>
-where
-    TPrice: AsRef<Price>,
-{
-    type Item = (&'book Price, &'book mut Level);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter
-            .next()
-            .map(|(t_price, level)| (t_price.as_ref(), level))
-    }
-}
-
-/// An iterator over the best bid or ask prices.
-///
-/// This enum exists for 2 reasons:
-///
-/// 1. to keep iteration over the bid levels as an implementation detail, with [`BestPricesIter`]
-///    the public interface.
-/// 2. to keep the `AskPrice` and `BidPrice` out of the public interface, which are
-///    parameterizing the ordering of the price-to-level map in the halfbooks.
-enum AsksOrBidsBestPricesIter<'book> {
-    Asks(BestPricesIter__<'book, AskPrice>),
-    Bids(BestPricesIter__<'book, BidPrice>),
-}
-
-impl<'book> Iterator for AsksOrBidsBestPricesIter<'book> {
-    type Item = (&'book Price, &'book mut Level);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            AsksOrBidsBestPricesIter::Asks(best_prices_iter) => best_prices_iter.next(),
-            AsksOrBidsBestPricesIter::Bids(best_prices_iter) => best_prices_iter.next(),
-        }
-    }
-}
-
-struct BestPricesIter<'book> {
-    inner: AsksOrBidsBestPricesIter<'book>,
-}
-
-impl<'book> Iterator for BestPricesIter<'book> {
-    type Item = (&'book Price, &'book mut Level);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
     }
 }
 
@@ -655,8 +693,8 @@ impl Book {
     /// That is either the lowest ask price or the highest bid price.
     pub fn best_price(&self, side: &order::Side) -> Option<&Price> {
         match side {
-            order::Side::Ask => self.asks.best_price(),
-            order::Side::Bid => self.bids.best_price(),
+            order::Side::Ask => self.asks.best_price().map(AsRef::as_ref),
+            order::Side::Bid => self.bids.best_price().map(AsRef::as_ref),
         }
     }
 
@@ -694,6 +732,7 @@ impl Book {
 
         if !order.is_post_only() && order.is_executable() {
             let remove_fn = make_remove_fn(&mut self.id_to_side_and_price);
+
             match order.side() {
                 order::Side::Ask => self.bids.perform_match(&mut order, log, remove_fn),
                 order::Side::Bid => self.asks.perform_match(&mut order, log, remove_fn),
@@ -719,12 +758,16 @@ impl Book {
     /// Cancels an order identified by its `id`.
     ///
     /// Returns if an order was removed (i.e. if an order of `key` was known by the system).
-    pub fn cancel_order(&mut self, id: &order::Id) -> Option<order::Order> {
-        let (side, type_, price) = self.id_to_side_and_price.get(id)?;
-        Some(match side {
-            order::Side::Ask => self.asks.cancel(id, type_, *price),
-            order::Side::Bid => self.bids.cancel(id, type_, *price),
-        })
+    pub fn cancel(&mut self, id: &order::Id, log: &mut transaction::Log) -> bool {
+        let Some((side, type_, price)) = self.id_to_side_and_price.get(id) else {
+            return false;
+        };
+        match side {
+            order::Side::Ask => self.asks.cancel(id, type_, price),
+            order::Side::Bid => self.bids.cancel(id, type_, price),
+        }
+        log.push(transaction::Event::Cancelled { id: *id });
+        true
     }
 
     /// Returns if the order [`id`] is known by the orderbook.
@@ -738,10 +781,9 @@ impl Book {
     /// A bid order crosses the market if its bid price is lower than or equal to the ask price on the book.
     pub fn does_order_cross_market(&self, order: &order::Order) -> bool {
         match order.side() {
-            order::Side::Ask => self.bids.best_price_level(),
-            order::Side::Bid => self.asks.best_price_level(),
+            order::Side::Ask => self.bids.is_crossed_by(order),
+            order::Side::Bid => self.asks.is_crossed_by(order),
         }
-        .is_some_and(|level| level.is_crossed_by_order(order))
     }
 
     /// Returns whether the [`side`] of the book has enough volume to satisfy the [`requested`] amount.
@@ -791,112 +833,110 @@ impl Book {
     ///
     /// Returns if orders have been activated.
     fn activate_stop_orders(&mut self, log: &mut crate::transaction::Log) {
-        'activation: loop {
+        // XXX: we will use these as the reference price to activate orders.
+        //
+        // This might very well mean that earlier stop-limit orders get filled
+        // at their set price while later stop-limit orders won't get filled at all
+        // but stil end up in the book as executable orders. But this seems to
+        // be an intuitive mode of operation: the market did drop below a certain
+        // price point but now does not have enough liquidity to accomadate the
+        // stop-limit orders.
+        let market_ask_price = self
+            .asks
+            .best_price()
+            .copied()
+            .unwrap_or_else(AskPrice::worst_possible);
+        let market_bid_price = self
+            .bids
+            .best_price()
+            .copied()
+            .unwrap_or_else(BidPrice::worst_possible);
+
+        'activate_all: loop {
             let mut have_activations_happened_on_iteration = false;
 
-            // activate bids
-            //
-            // TODO: there is a lot of duplication here. We should merge bid & ask activation, and also
-            // the high Book::match_and_add.
-            {
-                let Some(best_ask_price) = self.asks.best_price().copied() else {
-                    break 'activation;
-                };
-                let mut activation = self.bids.start_activate_stop_orders(&best_ask_price);
+            'activate_bids: for (bid_price, stop_level) in self.bids.stop_orders.levels_mut() {
+                if bid_price.is_worse_than(market_ask_price) {
+                    break 'activate_bids;
+                }
 
-                while let Some(mut stop_order) = activation.next_activating_order() {
+                for mut bid in stop_level.drain_orders() {
                     have_activations_happened_on_iteration = true;
 
-                    let _ = self.id_to_side_and_price.remove(stop_order.id()).expect(
-                        "invariant violated: a stop order at a level must be tracked by the book",
-                    );
-                    match stop_order.type_ {
-                        order::Type::Stop => {
-                            stop_order.type_ = order::Type::Market;
-                            self.asks.set_market_order_price(&mut stop_order);
-                        }
-                        order::Type::StopLimit => {
-                            stop_order.type_ = order::Type::Limit;
-                        }
-                        other => {
-                            unimplemented!("only stop orders can be activated; got `{other:?}`")
-                        }
-                    }
-
                     self.asks.perform_match(
-                        &mut stop_order,
+                        &mut bid,
                         log,
                         // XXX: need to construct the callback closure in the loop because we need to be able to insert the stop order into the map right after.
                         make_remove_fn(&mut self.id_to_side_and_price),
                     );
 
-                    if stop_order.is_filled() || stop_order.is_immediate() {
+                    if bid.is_filled() || bid.is_immediate() {
+                        let _ = self.id_to_side_and_price.remove(bid.id()).expect(
+                            "invariant violated: a stop order at a level must be tracked by the book",
+                        );
                         log.push(transaction::Event::Remove {
-                            id: *stop_order.id(),
-                            side: *stop_order.side(),
+                            id: *bid.id(),
+                            side: *bid.side(),
                             unfilled_quantity: order::Quantity::zero(),
                         });
                     } else {
-                        log.push(transaction::Event::Added(stop_order.clone()));
-                        self.id_to_side_and_price.insert(*stop_order.id(), (*stop_order.side(), *stop_order.type_(), *stop_order.price()))
-                            .expect("invariant violated: at the beginning of the loop we have removed this order from the book, and so it must not exist in the map");
-                        activation.add_order_unchecked(stop_order);
+                        log.push(transaction::Event::Added(bid.clone()));
+                        let item = self.id_to_side_and_price.get_mut(bid.id()).expect(
+                            "invariant violated: a stop order at a level must be tracked by the book",
+                        );
+                        *item = (*bid.side(), *bid.type_(), *bid.price());
+                        self.bids.levels.insert_order(bid);
                     }
                 }
             }
 
-            // activate asks
-            {
-                let Some(best_bid_price) = self.bids.best_price().copied() else {
-                    break 'activation;
-                };
-                let mut activation = self.asks.start_activate_stop_orders(&best_bid_price);
+            'activate_asks: for (ask_price, stop_level) in self.asks.stop_orders.levels_mut() {
+                if ask_price.is_worse_than(market_bid_price) {
+                    break 'activate_asks;
+                }
 
-                while let Some(mut stop_order) = activation.next_activating_order() {
+                for mut ask in stop_level.drain_orders() {
                     have_activations_happened_on_iteration = true;
 
-                    let _ = self.id_to_side_and_price.remove(stop_order.id()).expect(
-                        "invariant violated: a stop order at a level must be tracked by the book",
-                    );
-                    match stop_order.type_ {
-                        order::Type::Stop => {
-                            stop_order.type_ = order::Type::Market;
-                            self.bids.set_market_order_price(&mut stop_order);
-                        }
-                        order::Type::StopLimit => {
-                            stop_order.type_ = order::Type::Limit;
-                        }
-                        other => {
-                            unimplemented!("only stop orders can be activated; got `{other:?}`")
-                        }
-                    }
-
                     self.bids.perform_match(
-                        &mut stop_order,
+                        &mut ask,
                         log,
                         // XXX: need to construct the callback closure in the loop because we need to be able to insert the stop order into the map right after.
                         &mut make_remove_fn(&mut self.id_to_side_and_price),
                     );
 
-                    if stop_order.is_filled() || stop_order.is_immediate() {
+                    if ask.is_filled() || ask.is_immediate() {
+                        let _ = self.id_to_side_and_price.remove(ask.id()).expect(
+                            "invariant violated: a stop order at a level must be tracked by the book",
+                        );
                         log.push(transaction::Event::Remove {
-                            id: *stop_order.id(),
-                            side: *stop_order.side(),
-                            unfilled_quantity: *stop_order.quantity(),
+                            id: *ask.id(),
+                            side: *ask.side(),
+                            unfilled_quantity: *ask.quantity(),
                         });
                     } else {
-                        log.push(transaction::Event::Added(stop_order.clone()));
-                        self.id_to_side_and_price.insert(*stop_order.id(), (*stop_order.side(), *stop_order.type_(), *stop_order.price()))
-                            .expect("invariant violated: at the beginning of the loop we have removed this order from the book, and so it must not exist in the map");
-                        activation.add_order_unchecked(stop_order);
+                        log.push(transaction::Event::Added(ask.clone()));
+                        let item = self.id_to_side_and_price.get_mut(ask.id()).expect(
+                            "invariant violated: a stop order at a level must be tracked by the book",
+                        );
+                        *item = (*ask.side(), *ask.type_(), *ask.price());
+                        self.asks.levels.insert_order(ask);
                     }
                 }
             }
 
-            if have_activations_happened_on_iteration {
-                break 'activation;
+            if !have_activations_happened_on_iteration {
+                break 'activate_all;
             }
         }
+
+        // XXX: Drop all the empty levels at the end of the activation process.
+        //
+        // This has the following effect:
+        self.asks.drop_empty_levels();
+        self.bids.drop_empty_levels();
+        self.asks.drop_empty_stop_order_levels();
+        self.bids.drop_empty_stop_order_levels();
     }
 
     /// Run a full match loop over the entire orderbook.
@@ -916,35 +956,29 @@ impl Book {
                 let Some(best_ask_price) = self.asks.best_price().copied() else {
                     break 'match_bids;
                 };
-                'loop_bids: for (bid_price, bid_level) in &mut self.bids.levels {
-                    if bid_price.as_ref() < &best_ask_price {
+                'loop_bids: for (bid_price, bid_level) in &mut self.bids.levels.levels_mut() {
+                    if bid_price.is_worse_than(best_ask_price) {
                         break 'loop_bids;
                     }
                     let events_before = log.events.len();
                     // match every single bid to all asks
-                    for bid in &mut bid_level.inner {
+                    for bid in &mut bid_level.orders_mut() {
                         self.asks.perform_match(bid, log, &mut remove_fn);
-                    }
-                    // a second pass to remove filled bids is necessary because the iterator in the
-                    // previous loop needs to be stable
-                    bid_level.inner.retain(|order| {
-                        if order.is_filled() {
-                            remove_fn(order);
+                        if bid.is_filled() {
+                            remove_fn(bid);
                             log.push(transaction::Event::Remove {
-                                id: *order.id(),
-                                side: *order.side(),
+                                id: *bid.id(),
+                                side: *bid.side(),
                                 unfilled_quantity: order::Quantity::zero(),
                             });
-                            false
-                        } else {
-                            true
                         }
-                    });
+                    }
 
                     // We use the events logged as a proxy to determine if matches happened.
                     match_happened |= log.events.len() > events_before;
                 }
 
+                self.asks.drop_empty_levels();
                 self.bids.drop_empty_levels();
             }
 
@@ -958,35 +992,29 @@ impl Book {
                 let Some(best_bid_price) = self.bids.best_price().copied() else {
                     break 'match_asks;
                 };
-                'loop_bids: for (ask_price, ask_level) in &mut self.asks.levels {
-                    if ask_price.as_ref() > &best_bid_price {
+                'loop_bids: for (ask_price, ask_level) in self.asks.levels.levels_mut() {
+                    if ask_price.is_worse_than(best_bid_price) {
                         break 'loop_bids;
                     }
                     let events_before = log.events.len();
                     // match every single bid to all asks
                     for ask in &mut ask_level.inner {
                         self.bids.perform_match(ask, log, &mut remove_fn);
-                    }
-                    // a second pass to remove filled bids is necessary because the iterator in the
-                    // previous loop needs to be stable
-                    ask_level.inner.retain(|order| {
-                        if order.is_filled() {
-                            remove_fn(order);
+                        if ask.is_filled() {
+                            remove_fn(ask);
                             log.push(transaction::Event::Remove {
-                                id: *order.id(),
-                                side: *order.side(),
+                                id: *ask.id(),
+                                side: *ask.side(),
                                 unfilled_quantity: order::Quantity::zero(),
                             });
-                            false
-                        } else {
-                            true
                         }
-                    });
+                    }
 
                     // We use the events logged as a proxy to determine if matches happened.
                     match_happened |= log.events.len() > events_before;
                 }
 
+                self.asks.drop_empty_levels();
                 self.bids.drop_empty_levels();
             }
 
@@ -1007,11 +1035,41 @@ impl Default for Book {
     }
 }
 
+// utility to create a closure that is passed to the various matching functions to
+// remove orders in the higher-level id-to-side-and-price map (to avoid needing a
+// second pass over the data).
 fn make_remove_fn(
     map: &mut HashMap<order::Id, (order::Side, order::Type, Price)>,
 ) -> impl FnMut(&order::Order) {
     |order| {
         let _old = map.remove(order.id());
         crate::debug_assert_some!(_old);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AskPrice, BidPrice, HasSide};
+    use crate::order::Price;
+
+    #[test]
+    fn are_prices_better_than() {
+        let five = Price::new(5);
+        let ten = Price::new(10);
+        assert!(AskPrice::from(five).is_worse_than(ten));
+        assert!(AskPrice::from(five).is_worse_than(AskPrice::from(ten)));
+        assert!(AskPrice::from(five).is_worse_than(BidPrice::from(ten)));
+
+        assert!(!AskPrice::from(ten).is_worse_than(five));
+        assert!(!AskPrice::from(ten).is_worse_than(AskPrice::from(five)));
+        assert!(!AskPrice::from(ten).is_worse_than(BidPrice::from(five)));
+
+        assert!(BidPrice::from(five).is_worse_than(ten));
+        assert!(BidPrice::from(five).is_worse_than(AskPrice::from(ten)));
+        assert!(BidPrice::from(five).is_worse_than(BidPrice::from(ten)));
+
+        assert!(!BidPrice::from(ten).is_worse_than(five));
+        assert!(!BidPrice::from(ten).is_worse_than(AskPrice::from(five)));
+        assert!(!BidPrice::from(ten).is_worse_than(BidPrice::from(five)));
     }
 }

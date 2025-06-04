@@ -7,12 +7,16 @@ pub struct Log {
 }
 
 impl Log {
-    pub(crate) fn for_order(order: &order::Order) -> Self {
+    pub(crate) fn for_id(id: &order::Id) -> Self {
         Self {
-            order_id: *order.id(),
+            order_id: *id,
             // TODO: What's a good default for this?
             events: vec![],
         }
+    }
+
+    pub(crate) fn for_order(order: &order::Order) -> Self {
+        Self::for_id(order.id())
     }
 
     pub(crate) fn push(&mut self, event: Event) {
@@ -23,6 +27,8 @@ impl Log {
 pub enum Event {
     /// An order that was added to the orderbook.
     Added(order::Order),
+    /// Orders that have been cancelled.
+    Cancelled { id: order::Id },
     /// An order that has been fully executed and, if it was on the orderbook, removed from the orderbook.
     Remove {
         id: order::Id,
