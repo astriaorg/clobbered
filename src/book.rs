@@ -17,10 +17,13 @@ struct PriceToLevel<TPrice> {
     inner: BTreeMap<TPrice, Level>,
 }
 
-impl<TPrice> PriceToLevel<TPrice> {
-    fn new(side: Side) -> Self {
+impl<TPrice> PriceToLevel<TPrice>
+where
+    TPrice: HasSide,
+{
+    fn new() -> Self {
         Self {
-            side,
+            side: TPrice::side(),
             inner: BTreeMap::new(),
         }
     }
@@ -30,8 +33,17 @@ impl<TPrice> PriceToLevel<TPrice>
 where
     TPrice: Ord,
 {
+    /// Returns the best price contained in the level.
+    ///
+    /// Returns `None` if [`Self`] does not contain any
+    /// levels with volume.
     fn best_price(&self) -> Option<&TPrice> {
-        self.inner.first_key_value().map(|(price, _)| price)
+        for (price, level) in &self.inner {
+            if level.has_volume() {
+                return Some(price);
+            }
+        }
+        None
     }
 }
 
@@ -71,10 +83,6 @@ where
     /// Panics if the order is a market order.
     fn insert_order(&mut self, order: order::Order) {
         debug_assert_eq!(self.side, order.side);
-        debug_assert!(
-            order.has_volume(),
-            "empty orders should not be stored in the halfbook"
-        );
 
         let level = match order.type_() {
             order::Type::Market => {
@@ -331,8 +339,8 @@ where
     fn new() -> Self {
         Self {
             side: TPrice::side(),
-            levels: PriceToLevel::new(TPrice::side()),
-            stop_orders: PriceToLevel::new(TPrice::side()),
+            levels: PriceToLevel::new(),
+            stop_orders: PriceToLevel::new(),
         }
     }
 }
@@ -517,7 +525,7 @@ where
 {
     /// Adds an order to the halfbook.
     fn add_order_unchecked(&mut self, order: order::Order) {
-        debug_assert_eq!(self.side, order.side().opposite());
+        debug_assert_eq!(&self.side, order.side());
 
         // TODO: What are reasonable default sizes for the preallocated buffers?
         match order.type_() {
@@ -582,26 +590,13 @@ impl Book {
             return Err(AddOrderError::IdAlreadyExists(order));
         }
 
-        if self.does_order_cross_market(&order) {
-            if order.is_post_only() {
-                log.push(transaction::Event::Remove {
-                    id: *order.id(),
-                    side: *order.side(),
-                    unfilled_quantity: *order.quantity(),
-                });
-                return Ok(());
-            }
-
-            // if the order is a stop order and crosses the market, convert it to a market order.
-            match order.type_ {
-                order::Type::Stop => {
-                    order.type_ = order::Type::Market;
-                }
-                order::Type::StopLimit => {
-                    order.type_ = order::Type::Limit;
-                }
-                _ => {}
-            }
+        if order.is_post_only() && self.does_order_cross_market(&order) {
+            log.push(transaction::Event::Fill {
+                id: *order.id(),
+                side: *order.side(),
+                unfilled_quantity: *order.quantity(),
+            });
+            return Ok(());
         }
 
         if !order.is_post_only() && order.is_executable() {
@@ -614,13 +609,13 @@ impl Book {
         }
 
         if order.is_filled() || order.is_immediate() {
-            log.push(transaction::Event::Remove {
+            log.push(transaction::Event::Fill {
                 id: *order.id(),
                 side: *order.side(),
                 unfilled_quantity: *order.quantity(),
             });
         } else if !order.is_immediate() {
-            log.push(transaction::Event::Added(order.clone()));
+            log.push(transaction::Event::Add(order.clone()));
             self.add_order_unchecked(order);
         }
 
@@ -640,7 +635,7 @@ impl Book {
             Side::Ask => self.asks.cancel(id, type_, price),
             Side::Bid => self.bids.cancel(id, type_, price),
         }
-        log.push(transaction::Event::Cancelled { id: *id });
+        log.push(transaction::Event::Cancel { id: *id });
         true
     }
 
@@ -650,12 +645,22 @@ impl Book {
     }
 
     /// Returns the order identified by `id` if it exists in the book.
-    pub fn get(&self, id: &order::Id) -> Option<&order::Order> {
+    pub fn get_order(&self, id: &order::Id) -> Option<&order::Order> {
         let (side, type_, price) = self.id_to_side_and_price.get(id)?;
         match side {
             Side::Ask => self.asks.get(id, type_, price),
             Side::Bid => self.bids.get(id, type_, price),
         }
+    }
+
+    /// Returns the metadata for the order identified by `id` if it exists in the book.
+    ///
+    /// Right now, this is only tuple of [`Side`], `[Type]`, and [`Price`].
+    pub fn get_order_meta(
+        &self,
+        id: &order::Id,
+    ) -> Option<&(order::Side, order::Type, order::Price)> {
+        self.id_to_side_and_price.get(id)
     }
 
     /// Returns if [`order`] crosses the market.
@@ -753,13 +758,13 @@ impl Book {
                         let _ = self.id_to_side_and_price.remove(bid.id()).expect(
                             "invariant violated: a stop order at a level must be tracked by the book",
                         );
-                        log.push(transaction::Event::Remove {
+                        log.push(transaction::Event::Fill {
                             id: *bid.id(),
                             side: *bid.side(),
                             unfilled_quantity: order::Quantity::zero(),
                         });
                     } else {
-                        log.push(transaction::Event::Added(bid.clone()));
+                        log.push(transaction::Event::Add(bid.clone()));
                         let item = self.id_to_side_and_price.get_mut(bid.id()).expect(
                             "invariant violated: a stop order at a level must be tracked by the book",
                         );
@@ -788,13 +793,13 @@ impl Book {
                         let _ = self.id_to_side_and_price.remove(ask.id()).expect(
                             "invariant violated: a stop order at a level must be tracked by the book",
                         );
-                        log.push(transaction::Event::Remove {
+                        log.push(transaction::Event::Fill {
                             id: *ask.id(),
                             side: *ask.side(),
                             unfilled_quantity: *ask.quantity(),
                         });
                     } else {
-                        log.push(transaction::Event::Added(ask.clone()));
+                        log.push(transaction::Event::Add(ask.clone()));
                         let item = self.id_to_side_and_price.get_mut(ask.id()).expect(
                             "invariant violated: a stop order at a level must be tracked by the book",
                         );
@@ -829,7 +834,7 @@ impl Book {
             // first, execute all bids
             'match_bids: {
                 // XXX: Construct this closure here so we can pass it to the half-book matcher but
-                // drop it before running the activate-stop logic.
+                // drop it before running the activate-stops logic.
                 let mut remove_fn = make_remove_fn(&mut self.id_to_side_and_price);
 
                 let Some(best_ask_price) = self.asks.best_price().copied() else {
@@ -845,7 +850,7 @@ impl Book {
                         self.asks.perform_match(&mut bid, log, &mut remove_fn);
                         if bid.is_filled() {
                             remove_fn(&mut bid);
-                            log.push(transaction::Event::Remove {
+                            log.push(transaction::Event::Fill {
                                 id: *bid.id(),
                                 side: *bid.side(),
                                 unfilled_quantity: order::Quantity::zero(),
@@ -856,9 +861,6 @@ impl Book {
                     // We use the events logged as a proxy to determine if matches happened.
                     match_happened |= log.events.len() > events_before;
                 }
-
-                self.asks.drop_empty_levels();
-                self.bids.drop_empty_levels();
             }
 
             // then, execute all asks
@@ -881,7 +883,7 @@ impl Book {
                         self.bids.perform_match(&mut ask, log, &mut remove_fn);
                         if ask.is_filled() {
                             remove_fn(&mut ask);
-                            log.push(transaction::Event::Remove {
+                            log.push(transaction::Event::Fill {
                                 id: *ask.id(),
                                 side: *ask.side(),
                                 unfilled_quantity: order::Quantity::zero(),
@@ -892,16 +894,13 @@ impl Book {
                     // We use the events logged as a proxy to determine if matches happened.
                     match_happened |= log.events.len() > events_before;
                 }
-
-                self.asks.drop_empty_levels();
-                self.bids.drop_empty_levels();
             }
 
             let events_before = log.events.len();
             self.activate_stop_orders(log);
             match_happened |= log.events.len() > events_before;
 
-            if match_happened {
+            if !match_happened {
                 break 'full_match;
             }
         }
@@ -928,8 +927,20 @@ fn make_remove_fn(
 
 #[cfg(test)]
 mod tests {
-    use super::{AskPrice, BidPrice, HasSide};
-    use crate::order::Price;
+    use super::{AskPrice, BidPrice, Book, HasSide, PriceToLevel};
+    use crate::{
+        order::{Id, Order, Price, Quantity, Side, Type},
+        transaction::{self, Event},
+    };
+
+    fn order() -> Order {
+        Order::builder()
+            .quantity(Quantity::new(10))
+            .price(Price::new(5))
+            .side(Side::Ask)
+            .build()
+            .unwrap()
+    }
 
     #[test]
     fn are_prices_better_than() {
@@ -950,5 +961,107 @@ mod tests {
         assert!(!BidPrice::from(ten).is_worse_than(five));
         assert!(!BidPrice::from(ten).is_worse_than(AskPrice::from(five)));
         assert!(!BidPrice::from(ten).is_worse_than(BidPrice::from(five)));
+    }
+
+    #[test]
+    fn limit_order_is_added_to_empty_book() {
+        let mut book = Book::new();
+        let id = Id::new(uuid::Uuid::new_v4());
+        let price = Price::new(10);
+        let side = Side::Bid;
+        let type_ = Type::Limit;
+        let order = Order {
+            id,
+            side,
+            price,
+            type_,
+            ..order()
+        };
+        let mut logs = transaction::Log::new();
+        book.execute(order, &mut logs).unwrap();
+        logs.iter()
+            .find(|event| event.is_add())
+            .expect("there should be an event for adding the order to the book");
+        assert_eq!(
+            Some(&(side, type_, price)),
+            book.get_order_meta(&id),
+            "the order should exist in the book"
+        );
+        assert_eq!(
+            Some(&price),
+            book.best_price(&side),
+            "the best bid price should be the price of the order just added",
+        );
+    }
+
+    #[test]
+    fn market_order_is_not_added_to_the_book() {
+        let mut book = Book::new();
+        let id = Id::new(uuid::Uuid::new_v4());
+        let side = Side::Bid;
+        let type_ = Type::Market;
+        let order = Order {
+            id,
+            side,
+            type_,
+            ..order()
+        };
+        let mut logs = transaction::Log::new();
+        book.execute(order, &mut logs).unwrap();
+        logs.iter()
+            .find(|event| event.is_fill())
+            .expect("there should be an event for filling the market order");
+        crate::assert_none!(logs.iter().find(|event| event.is_add()));
+
+        crate::assert_none!(
+            book.get_order_meta(&id),
+            "a market order should not exist in the book",
+        );
+        crate::assert_none!(
+            book.best_price(&side),
+            "the book is still empty, there should not be a best price",
+        );
+    }
+
+    #[test]
+    fn stop_limit_order_is_added_to_book() {
+        let mut book = Book::new();
+        let id = Id::new(uuid::Uuid::new_v4());
+        let price = Price::new(10);
+        let side = Side::Bid;
+        let type_ = Type::StopLimit;
+        let order = Order {
+            id,
+            side,
+            price,
+            type_,
+            ..order()
+        };
+        let mut logs = transaction::Log::new();
+        book.execute(order, &mut logs).unwrap();
+        logs.iter()
+            .find(|event| event.is_add())
+            .expect("there should be an event for adding the order to the book");
+        assert_eq!(
+            Some(&(side, type_, price)),
+            book.get_order_meta(&id),
+            "the orders should exist in the book"
+        );
+        crate::assert_none!(
+            book.best_price(&side),
+            "there should not be a best bid price because the order is a stop order "
+        );
+    }
+
+    #[test]
+    fn price_level_with_empty_levels_does_not_have_best_price() {
+        let mut price_to_levels = PriceToLevel::<AskPrice>::new();
+        for _ in 0..3 {
+            price_to_levels.insert_order(Order {
+                quantity: Quantity::zero(),
+                ..order()
+            });
+        }
+        crate::assert_none!(price_to_levels.best_price());
     }
 }

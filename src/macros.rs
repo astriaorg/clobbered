@@ -17,6 +17,25 @@ macro_rules! assert_ok {
         }
     }
 }
+#[macro_export]
+macro_rules! assert_none {
+    ($cond:expr $(,)?) => {
+        match $cond {
+            Some(t) => {
+                panic!("assertion failed, expected None, got Some({t:?})");
+            }
+            None => {}
+        }
+    };
+    ($cond:expr, $($arg:tt)+) => {
+        match $cond {
+            Some(t) => {
+                panic!("assertion failed, expected None, Some({t:?}): {}", format_args!($($arg)+));
+            }
+            None => {}
+        }
+    }
+}
 
 #[macro_export]
 macro_rules! assert_some {
@@ -30,8 +49,8 @@ macro_rules! assert_some {
     };
     ($cond:expr, $($arg:tt)+) => {
         match $cond {
-            Ok(t) => t,
-            Err(e) => {
+            Some(t) => t,
+            None => {
                 panic!("assertion failed, expected Some(..), got None: {}", format_args!($($arg)+));
             }
         }

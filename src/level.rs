@@ -143,7 +143,7 @@ impl Level {
 
             if maker.is_filled() {
                 on_remove(&maker);
-                log.push(transaction::Event::Remove {
+                log.push(transaction::Event::Fill {
                     id: *maker.id(),
                     side: *maker.side(),
                     unfilled_quantity: Quantity::zero(),
