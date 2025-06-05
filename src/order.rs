@@ -1,5 +1,18 @@
+#[derive(Debug, PartialEq, Eq)]
+pub enum Error {
+    NoPrice,
+    NoSide,
+    NoStopPrice,
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Id(uuid::Uuid);
+
+impl Id {
+    pub fn new(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
+    }
+}
 
 /// A non-negative price of an asset.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,10 +51,12 @@ impl Price {
     /// This method saturates at the minimum of the underlying primitive.
     ///
     /// # Examples
+    ///
     /// ```
+    /// # use clobbered::order::{Price, Slippage};
     /// let price = Price::new(10);
     /// assert_eq!(price.minus_slippage(&Slippage::new(5)), Price::new(5));
-    /// assert_eq!(price.minus_slippage(&Slippage::new(2)), Price::new(0));
+    /// assert_eq!(price.minus_slippage(&Slippage::new(2)), Price::new(8));
     /// ```
     pub fn minus_slippage(&self, slippage: &Slippage) -> Self {
         Self(self.0.saturating_sub(slippage.0))
@@ -54,6 +69,7 @@ impl Price {
     ///
     /// # Examples
     /// ```
+    /// # use clobbered::order::{Price, Side};
     /// let price = Price::new(20);
     /// assert!(price.is_better_than_or_equal_to(&Price::new(30), &Side::Ask));
     /// assert!(!price.is_better_than_or_equal_to(&Price::new(30), &Side::Bid));
@@ -77,7 +93,7 @@ impl AsRef<Price> for Price {
 pub struct Slippage(u128);
 
 impl Slippage {
-    fn new(value: u128) -> Self {
+    pub fn new(value: u128) -> Self {
         Self(value)
     }
 }
@@ -138,11 +154,12 @@ impl Side {
     /// # Examples
     ///
     /// ```
+    /// # use clobbered::order::Side;
     /// let ask = Side::Ask;
     /// let bid = Side::Bid;
     /// assert_eq!(ask.opposite(), bid);
     /// assert_eq!(bid.opposite(), ask);
-    /// assert_eq!(ask.opposite().opposite(). ask),
+    /// assert_eq!(ask.opposite().opposite(), ask);
     /// ```
     pub fn opposite(&self) -> Side {
         match self {
@@ -168,12 +185,18 @@ impl Side {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Type {
-    Market,
     Limit,
+    Market,
     Stop,
     StopLimit,
     // TrailingStop,
     // TrailingStopLimit,
+}
+
+impl Type {
+    fn is_stop(&self) -> bool {
+        matches!(self, Self::Stop | Self::StopLimit)
+    }
 }
 
 /// + `GoodTillCanceled`: the order stays live until it's fulfilled or cancelled.
@@ -191,6 +214,125 @@ pub enum TimeInForce {
     FillOrKill,
     AllOrNone,
     // GoodTillDate,
+}
+
+pub struct Builder {
+    id: Id,
+    type_: Type,
+    time_in_force: TimeInForce,
+    side: Option<Side>,
+    quantity: Quantity,
+    price: Option<Price>,
+    stop_price: Option<Price>,
+    slippage: Option<Slippage>,
+    post_only: bool,
+}
+
+impl Builder {
+    pub fn new() -> Self {
+        Self {
+            id: Id::new(uuid::Uuid::nil()),
+            type_: Type::Limit,
+            time_in_force: TimeInForce::GoodTillCanceled,
+            side: None,
+            quantity: Quantity::zero(),
+            price: None,
+            stop_price: None,
+            slippage: None,
+            post_only: false,
+        }
+    }
+
+    pub fn id(self, id: Id) -> Self {
+        Self { id, ..self }
+    }
+
+    pub fn type_(self, type_: Type) -> Self {
+        Self { type_, ..self }
+    }
+
+    pub fn time_in_force(self, time_in_force: TimeInForce) -> Self {
+        Self {
+            time_in_force,
+            ..self
+        }
+    }
+
+    pub fn side(self, side: Side) -> Self {
+        Self {
+            side: Some(side),
+            ..self
+        }
+    }
+
+    pub fn quantity(self, quantity: Quantity) -> Self {
+        Self { quantity, ..self }
+    }
+
+    pub fn price(self, price: Price) -> Self {
+        Self {
+            price: Some(price),
+            ..self
+        }
+    }
+
+    pub fn stop_price(self, stop_price: Price) -> Self {
+        Self {
+            stop_price: Some(stop_price),
+            ..self
+        }
+    }
+
+    pub fn slippage(self, slippage: Slippage) -> Self {
+        Self {
+            slippage: Some(slippage),
+            ..self
+        }
+    }
+
+    pub fn post_only(self, post_only: bool) -> Self {
+        Self { post_only, ..self }
+    }
+
+    pub fn build(self) -> Result<Order, Error> {
+        let Self {
+            id,
+            type_,
+            time_in_force,
+            side,
+            quantity,
+            price,
+            stop_price,
+            slippage,
+            post_only,
+        } = self;
+        let side = side.ok_or(Error::NoSide)?;
+        let price = price.ok_or(Error::NoPrice)?;
+
+        // XXX: For stop orders The stop price must be set. Otherwise the value itself
+        // doesn't matter and is just passed through (the orderbook will not look at it).
+        let stop_price = stop_price
+            .or_else(|| {
+                if type_.is_stop() {
+                    None
+                } else {
+                    Some(Price::zero())
+                }
+            })
+            .ok_or(Error::NoStopPrice)?;
+
+        Ok(Order {
+            id,
+            type_,
+            time_in_force,
+            side,
+            quantity,
+            price,
+            stop_price,
+            slippage,
+            post_only,
+        })
+    }
 }
 
 /// An order.
@@ -233,6 +375,10 @@ pub struct Order {
 }
 
 impl Order {
+    pub fn builder() -> Builder {
+        Builder::new()
+    }
+
     pub fn id(&self) -> &Id {
         &self.id
     }
@@ -319,7 +465,7 @@ impl Order {
 
     /// Returns if the order is a stop order.
     pub fn is_stop(&self) -> bool {
-        matches!(self.type_, Type::Stop | Type::StopLimit,)
+        self.type_.is_stop()
     }
 
     /// Sets the market price of the order, taking into accounts its side and slippage setting.
@@ -363,5 +509,38 @@ impl Order {
             self.time_in_force,
             TimeInForce::FillOrKill | TimeInForce::AllOrNone
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, Order, Price, Side, Type};
+
+    #[test]
+    fn orders_must_have_a_side_set() {
+        assert_eq!(
+            Err(Error::NoSide),
+            Order::builder().price(Price::new(5)).build(),
+        );
+    }
+
+    #[test]
+    fn orders_must_have_a_price_set() {
+        assert_eq!(
+            Err(Error::NoPrice),
+            Order::builder().side(Side::Ask).build(),
+        );
+    }
+
+    #[test]
+    fn stop_orders_must_have_stop_price_set() {
+        assert_eq!(
+            Err(Error::NoStopPrice),
+            Order::builder()
+                .type_(Type::Stop)
+                .price(Price::new(5))
+                .side(Side::Ask)
+                .build(),
+        );
     }
 }

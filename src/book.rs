@@ -1,3 +1,4 @@
+use crate::level::Level;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::{
@@ -131,10 +132,11 @@ where
 {
     /// Clears levels of orders with zero volume and removes levels with no volume.
     fn clean_levels_and_drop_empty(&mut self) {
-        // TODO: this might be an avenue for improvement by doing a better job at tracking
-        // the "holes"/orders with no volume.
         self.inner.retain(|_, level| {
-            level.drop_filled_orders();
+            // XXX: Only compact levels if they have volume. Otherwise just drop them directly.
+            if level.has_volume() {
+                level.make_compact();
+            }
             level.has_volume()
         });
     }
@@ -175,163 +177,6 @@ where
     /// The levels are from best to worst (ascending if ask, descending if bid).
     fn levels_mut(&mut self) -> impl Iterator<Item = (&TPrice, &mut Level)> {
         self.inner.iter_mut()
-    }
-}
-
-/// A price-level of the orderbook.
-#[derive(Debug)]
-struct Level {
-    /// The side that this level is on.
-    side: order::Side,
-    /// The price which this levels applies to.
-    price: Price,
-    /// The deque is optimal for adding at the front and pushing
-    /// at the back (so, the primary operations performed at a level).
-    ///
-    /// Removing a element from the middle of the deque is (i.e. element at index i): O(min(i, n-i)).
-    /// This is why it *should* be better than a vec.
-    ///
-    /// However, it should be investigated what the actually best datastructure would be.
-    ///
-    /// TODO: investigate if this should be replaced by a BTreeSet
-    /// or Vec or VecDeque (or even IndexMap). All depends on the optimal performance
-    /// for the different operations.
-    inner: Vec<order::Order>,
-}
-
-impl Level {
-    fn new(price: Price, side: order::Side) -> Self {
-        Self {
-            side,
-            price,
-            // TODO: What's an optimal pre-allocated size for the deque?
-            // Either way, we should probably think about using some kind of
-            // arena anyway.
-            inner: Vec::with_capacity(1024),
-        }
-    }
-
-    /// Returns if the level has any makers.
-    ///
-    /// This function relies on empty orders having been removed from the level via
-    /// [`Self::drop_empty_orders`]. If this operation has not been performed then
-    /// the output of this function is meaningless.
-    fn has_volume(&self) -> bool {
-        !self.inner.is_empty()
-    }
-
-    /// Returns whether [`order`] crosses the level.
-    ///
-    /// The level is crossed if:
-    ///
-    /// + level.side is ask and level.price <= order.price,
-    /// + level.side is bid and level.price >= order.price
-    ///
-    /// If `order` is a stop order, then order.stop_price is used instead.
-    ///
-    /// This function assumes that [`order`] has the opposite side of the level.
-    /// If it does not then this method is meaningless.
-    fn is_crossed_by_order(&self, order: &order::Order) -> bool {
-        debug_assert_eq!(self.side, order.side.opposite());
-        let order_price = if order.is_stop() {
-            order.stop_price()
-        } else {
-            order.price()
-        };
-        match &self.side {
-            order::Side::Ask => &self.price <= order_price,
-            order::Side::Bid => &self.price >= order_price,
-        }
-    }
-
-    // fn pop(&mut self) -> Option<order::Order> {
-    //     self.inner.pop_front()
-    // }
-
-    /// Pushes a new order to the back of the level.
-    fn push(&mut self, order: order::Order) {
-        debug_assert_eq!(&self.side, order.side());
-        self.inner.push(order);
-    }
-
-    /// Cancels the order identified by `id`.
-    fn cancel(&mut self, id: &order::Id) {
-        for order in &mut self.inner {
-            if order.id() == id {
-                order.quantity = order::Quantity::zero();
-                return;
-            }
-        }
-    }
-
-    /// Matches a taker [`order`] to the orders at this price level.
-    ///
-    /// Returns a transaction log of the executions performed.
-    fn match_order<FOnRemove>(
-        &mut self,
-        taker: &mut order::Order,
-        log: &mut transaction::Log,
-        mut on_remove: FOnRemove,
-    ) where
-        FOnRemove: FnMut(&order::Order),
-    {
-        let level_price = self.price;
-        'match_loop: for maker in &mut self.orders_mut() {
-            let mut quantity = order::Quantity::zero();
-            if taker.quantity() >= maker.quantity() {
-                quantity = taker.quantity().saturating_sub(maker.quantity());
-                taker.quantity = taker.quantity().saturating_sub(&quantity);
-                maker.quantity = order::Quantity::zero();
-            } else if !maker.needs_full_execution() {
-                quantity = maker.quantity().saturating_sub(maker.quantity());
-                maker.quantity = maker.quantity().saturating_sub(&quantity);
-                taker.quantity = order::Quantity::zero();
-            }
-
-            // A match only happened if the amount exchanged isn't zero. This covers the
-            // case where the maker needs full execution, i.e. all-or-none.
-            if !quantity.is_zero() {
-                log.push(transaction::Event::Match {
-                    active_order_id: *taker.id(),
-                    passive_order_id: *maker.id(),
-                    price: level_price,
-                    quantity,
-                });
-            }
-
-            if maker.is_filled() {
-                on_remove(maker);
-                log.push(transaction::Event::Remove {
-                    id: *maker.id(),
-                    side: *maker.side(),
-                    unfilled_quantity: order::Quantity::zero(),
-                });
-            }
-
-            if taker.is_filled() {
-                break 'match_loop;
-            }
-        }
-    }
-
-    /// Returns an iterator over the orders at this level.
-    fn orders(&self) -> impl Iterator<Item = &order::Order> {
-        self.inner.iter().filter(|ord| ord.has_volume())
-    }
-
-    /// Returns an iterator over the orders at this level.
-    fn orders_mut(&mut self) -> impl Iterator<Item = &mut order::Order> {
-        self.inner.iter_mut().filter(|ord| ord.has_volume())
-    }
-
-    /// Drains the orders from this level, leaving it empty.
-    fn drain_orders(&mut self) -> impl Iterator<Item = order::Order> {
-        self.inner.drain(..).filter(|order| order.has_volume())
-    }
-
-    /// Removes orders from the level that have no volume and keeps those that do.
-    fn drop_filled_orders(&mut self) {
-        self.inner.retain(|order| order.has_volume())
     }
 }
 
@@ -962,10 +807,10 @@ impl Book {
                     }
                     let events_before = log.events.len();
                     // match every single bid to all asks
-                    for bid in &mut bid_level.orders_mut() {
-                        self.asks.perform_match(bid, log, &mut remove_fn);
+                    for mut bid in bid_level.orders_mut() {
+                        self.asks.perform_match(&mut bid, log, &mut remove_fn);
                         if bid.is_filled() {
-                            remove_fn(bid);
+                            remove_fn(&mut bid);
                             log.push(transaction::Event::Remove {
                                 id: *bid.id(),
                                 side: *bid.side(),
@@ -998,10 +843,10 @@ impl Book {
                     }
                     let events_before = log.events.len();
                     // match every single bid to all asks
-                    for ask in &mut ask_level.inner {
-                        self.bids.perform_match(ask, log, &mut remove_fn);
+                    for mut ask in &mut ask_level.orders_mut() {
+                        self.bids.perform_match(&mut ask, log, &mut remove_fn);
                         if ask.is_filled() {
-                            remove_fn(ask);
+                            remove_fn(&mut ask);
                             log.push(transaction::Event::Remove {
                                 id: *ask.id(),
                                 side: *ask.side(),
@@ -1056,13 +901,13 @@ mod tests {
     fn are_prices_better_than() {
         let five = Price::new(5);
         let ten = Price::new(10);
-        assert!(AskPrice::from(five).is_worse_than(ten));
-        assert!(AskPrice::from(five).is_worse_than(AskPrice::from(ten)));
-        assert!(AskPrice::from(five).is_worse_than(BidPrice::from(ten)));
+        assert!(AskPrice::from(ten).is_worse_than(five));
+        assert!(AskPrice::from(ten).is_worse_than(AskPrice::from(five)));
+        assert!(AskPrice::from(ten).is_worse_than(BidPrice::from(five)));
 
-        assert!(!AskPrice::from(ten).is_worse_than(five));
-        assert!(!AskPrice::from(ten).is_worse_than(AskPrice::from(five)));
-        assert!(!AskPrice::from(ten).is_worse_than(BidPrice::from(five)));
+        assert!(!AskPrice::from(five).is_worse_than(ten));
+        assert!(!AskPrice::from(five).is_worse_than(AskPrice::from(ten)));
+        assert!(!AskPrice::from(five).is_worse_than(BidPrice::from(ten)));
 
         assert!(BidPrice::from(five).is_worse_than(ten));
         assert!(BidPrice::from(five).is_worse_than(AskPrice::from(ten)));
