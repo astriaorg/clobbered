@@ -1,10 +1,20 @@
-use crate::{level::Level, order::Side};
+use crate::{level::Level, order::Side, transaction::Event};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     order::{self, Price},
     transaction,
 };
+
+impl order::Order {
+    fn reference_price(&self) -> &Price {
+        if self.is_stop() {
+            self.stop_price()
+        } else {
+            self.price()
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AddOrderError {
@@ -90,8 +100,8 @@ where
             }
             _all_others => self
                 .inner
-                .entry(TPrice::from(*order.price()))
-                .or_insert_with(|| Level::new(*order.price(), self.side)),
+                .entry(TPrice::from(*order.reference_price()))
+                .or_insert_with(|| Level::new(*order.reference_price(), self.side)),
         };
         level.push(order);
     }
@@ -438,6 +448,7 @@ where
             .as_ref();
 
         // Performs the conversion of stop order to executable order.
+        let was_stop = order.is_stop();
         match order.type_ {
             order::Type::Stop => {
                 order.type_ = order::Type::Market;
@@ -451,6 +462,10 @@ where
                 order.type_ = order::Type::Limit;
             }
             _ => {}
+        }
+
+        if was_stop {
+            log.push(Event::Activate(order.clone()));
         }
 
         if order.is_market() {
@@ -591,7 +606,7 @@ impl Book {
         }
 
         if order.is_post_only() && self.does_order_cross_market(&order) {
-            log.push(transaction::Event::Fill {
+            log.push(transaction::Fill {
                 id: *order.id(),
                 side: *order.side(),
                 unfilled_quantity: *order.quantity(),
@@ -599,6 +614,9 @@ impl Book {
             return Ok(());
         }
 
+        // TODO: should stop orders actually be executed at this point already or should they
+        // first be put in the book and then executed? If we attempted to execute them here
+        // already, we'd need to check if they are activated inside `perform_match`.
         if !order.is_post_only() && order.is_executable() {
             let remove_fn = make_remove_fn(&mut self.id_to_side_and_price);
 
@@ -609,13 +627,13 @@ impl Book {
         }
 
         if order.is_filled() || order.is_immediate() {
-            log.push(transaction::Event::Fill {
+            log.push(transaction::Fill {
                 id: *order.id(),
                 side: *order.side(),
                 unfilled_quantity: *order.quantity(),
             });
         } else if !order.is_immediate() {
-            log.push(transaction::Event::Add(order.clone()));
+            log.push(Event::Add(order.clone()));
             self.add_order_unchecked(order);
         }
 
@@ -635,7 +653,7 @@ impl Book {
             Side::Ask => self.asks.cancel(id, type_, price),
             Side::Bid => self.bids.cancel(id, type_, price),
         }
-        log.push(transaction::Event::Cancel { id: *id });
+        log.push(Event::Cancel { id: *id });
         true
     }
 
@@ -705,8 +723,10 @@ impl Book {
     /// crossing the book, duplicate order IDs, zero quantity requested, and
     /// others).
     fn add_order_unchecked(&mut self, order: order::Order) {
-        self.id_to_side_and_price
-            .insert(*order.id(), (*order.side(), *order.type_(), *order.price()));
+        self.id_to_side_and_price.insert(
+            *order.id(),
+            (*order.side(), *order.type_(), *order.reference_price()),
+        );
         match *order.side() {
             Side::Ask => self.asks.add_order_unchecked(order),
             Side::Bid => self.bids.add_order_unchecked(order),
@@ -758,13 +778,13 @@ impl Book {
                         let _ = self.id_to_side_and_price.remove(bid.id()).expect(
                             "invariant violated: a stop order at a level must be tracked by the book",
                         );
-                        log.push(transaction::Event::Fill {
+                        log.push(transaction::Fill {
                             id: *bid.id(),
                             side: *bid.side(),
                             unfilled_quantity: order::Quantity::zero(),
                         });
                     } else {
-                        log.push(transaction::Event::Add(bid.clone()));
+                        log.push(Event::Add(bid.clone()));
                         let item = self.id_to_side_and_price.get_mut(bid.id()).expect(
                             "invariant violated: a stop order at a level must be tracked by the book",
                         );
@@ -775,6 +795,7 @@ impl Book {
             }
 
             'activate_asks: for (ask_price, stop_level) in self.asks.stop_orders.levels_mut() {
+                println!("{ask_price:?} {market_bid_price:?}");
                 if ask_price.is_worse_than(market_bid_price) {
                     break 'activate_asks;
                 }
@@ -793,13 +814,13 @@ impl Book {
                         let _ = self.id_to_side_and_price.remove(ask.id()).expect(
                             "invariant violated: a stop order at a level must be tracked by the book",
                         );
-                        log.push(transaction::Event::Fill {
+                        log.push(transaction::Fill {
                             id: *ask.id(),
                             side: *ask.side(),
                             unfilled_quantity: *ask.quantity(),
                         });
                     } else {
-                        log.push(transaction::Event::Add(ask.clone()));
+                        log.push(Event::Add(ask.clone()));
                         let item = self.id_to_side_and_price.get_mut(ask.id()).expect(
                             "invariant violated: a stop order at a level must be tracked by the book",
                         );
@@ -850,7 +871,7 @@ impl Book {
                         self.asks.perform_match(&mut bid, log, &mut remove_fn);
                         if bid.is_filled() {
                             remove_fn(&mut bid);
-                            log.push(transaction::Event::Fill {
+                            log.push(transaction::Fill {
                                 id: *bid.id(),
                                 side: *bid.side(),
                                 unfilled_quantity: order::Quantity::zero(),
@@ -862,6 +883,7 @@ impl Book {
                     match_happened |= log.events.len() > events_before;
                 }
             }
+            println!("have stop bid matches happened: {match_happened}");
 
             // then, execute all asks
             // TODO: streamline both of these loops to avoid all that duplicate logic.
@@ -883,7 +905,7 @@ impl Book {
                         self.bids.perform_match(&mut ask, log, &mut remove_fn);
                         if ask.is_filled() {
                             remove_fn(&mut ask);
-                            log.push(transaction::Event::Fill {
+                            log.push(transaction::Fill {
                                 id: *ask.id(),
                                 side: *ask.side(),
                                 unfilled_quantity: order::Quantity::zero(),
@@ -896,9 +918,13 @@ impl Book {
                 }
             }
 
+            println!("have ask bid matches happened: {match_happened}");
+
             let events_before = log.events.len();
             self.activate_stop_orders(log);
             match_happened |= log.events.len() > events_before;
+
+            println!("have activation matches happened: {match_happened}");
 
             if !match_happened {
                 break 'full_match;
@@ -930,7 +956,7 @@ mod tests {
     use super::{AskPrice, BidPrice, Book, HasSide, PriceToLevel};
     use crate::{
         order::{Id, Order, Price, Quantity, Side, Type},
-        transaction::{self, Event},
+        transaction::{self, Fill, Log},
     };
 
     fn order() -> Order {
@@ -965,6 +991,9 @@ mod tests {
 
     #[test]
     fn limit_order_is_added_to_empty_book() {
+        // scenario: the orderbook is empty, a limit order comes in
+        //
+        // expected result: the limit order is added to the book.
         let mut book = Book::new();
         let id = Id::new(uuid::Uuid::new_v4());
         let price = Price::new(10);
@@ -977,7 +1006,7 @@ mod tests {
             type_,
             ..order()
         };
-        let mut logs = transaction::Log::new();
+        let mut logs = Log::new();
         book.execute(order, &mut logs).unwrap();
         logs.iter()
             .find(|event| event.is_add())
@@ -995,22 +1024,30 @@ mod tests {
     }
 
     #[test]
-    fn market_order_is_not_added_to_the_book() {
+    fn market_order_is_passed_through_empty_book() {
+        // scenario: the orderbook is empty, a market order comes in
+        //
+        // expected result: the market order is passed through and left
+        // completely unfilled.
         let mut book = Book::new();
         let id = Id::new(uuid::Uuid::new_v4());
         let side = Side::Bid;
         let type_ = Type::Market;
+        let quantity = Quantity::new(42);
         let order = Order {
             id,
             side,
             type_,
+            quantity,
             ..order()
         };
-        let mut logs = transaction::Log::new();
+        let mut logs = Log::new();
         book.execute(order, &mut logs).unwrap();
-        logs.iter()
-            .find(|event| event.is_fill())
-            .expect("there should be an event for filling the market order");
+        let fill = logs
+            .iter()
+            .find_map(|event| event.as_fill())
+            .expect("there should be an event for adding the order to the book");
+        assert_eq!(fill.unfilled_quantity, quantity);
         crate::assert_none!(logs.iter().find(|event| event.is_add()));
 
         crate::assert_none!(
@@ -1024,26 +1061,194 @@ mod tests {
     }
 
     #[test]
+    fn market_order_is_partially_filled() {
+        // scenario: an ask-limit order sits on the book, a bid market order comes in,
+        // requesting more volume than available.
+        //
+        // expected result: the market order is partially filled at the price of the ask
+        // order, the ask order limit order is completely filled.
+        let mut book = Book::new();
+        let ask_id = Id::new(uuid::Uuid::new_v4());
+        let ask_quantity = Quantity::new(9);
+        let ask_price = Price::new(5);
+        let mut log = Log::new();
+        crate::assert_ok!(book.execute(
+            Order {
+                id: ask_id,
+                quantity: ask_quantity,
+                price: ask_price,
+                side: Side::Ask,
+                ..order()
+            },
+            &mut log,
+        ));
+        let bid_id = Id::new(uuid::Uuid::new_v4());
+        let bid_quantity = Quantity::new(20);
+        crate::assert_ok!(book.execute(
+            Order {
+                id: bid_id,
+                quantity: bid_quantity,
+                type_: Type::Market,
+                side: Side::Bid,
+                ..order()
+            },
+            &mut log,
+        ));
+        let match_ = log.iter().find_map(|event| event.as_match()).unwrap();
+        assert_eq!(
+            &transaction::Match {
+                active_order_id: bid_id,
+                passive_order_id: ask_id,
+                price: ask_price,
+                quantity: ask_quantity
+            },
+            match_
+        );
+        let fill_ask = log
+            .iter()
+            .find_map(|event| {
+                {
+                    event
+                        .as_fill()
+                        .and_then(|fill| (fill.id == ask_id).then_some(fill))
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            &Fill {
+                id: ask_id,
+                side: Side::Ask,
+                unfilled_quantity: Quantity::zero(),
+            },
+            fill_ask,
+        );
+        let fill_bid = log
+            .iter()
+            .find_map(|event| {
+                {
+                    event
+                        .as_fill()
+                        .and_then(|fill| (fill.id == bid_id).then_some(fill))
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            &Fill {
+                id: bid_id,
+                side: Side::Bid,
+                unfilled_quantity: Quantity::new(11),
+            },
+            fill_bid,
+        );
+    }
+
+    #[test]
+    fn market_order_is_filled_by_two_orders() {
+        // scenario: two ask-limit order sit on the book at different prices,
+        // a bid market order comes in, requesting less than the total available volume,
+        // but more than the volumes provided by each of the on-book orders.
+        //
+        // expected result: the market order is completely filled. The ask order
+        // at the lower price is completey filled. The ask order at the higher price
+        // is partially filled.
+        let mut book = Book::new();
+
+        let cheap_id = Id::new(uuid::Uuid::new_v4());
+        let expensive_id = Id::new(uuid::Uuid::new_v4());
+
+        let mut log = Log::new();
+        crate::assert_ok!(book.execute(
+            Order {
+                id: cheap_id,
+                quantity: Quantity::new(5),
+                price: Price::new(5),
+                side: Side::Ask,
+                ..order()
+            },
+            &mut log,
+        ));
+        crate::assert_ok!(book.execute(
+            Order {
+                id: expensive_id,
+                quantity: Quantity::new(5),
+                price: Price::new(6),
+                side: Side::Ask,
+                ..order()
+            },
+            &mut log,
+        ));
+        let bid_id = Id::new(uuid::Uuid::new_v4());
+        crate::assert_ok!(book.execute(
+            Order {
+                id: bid_id,
+                quantity: Quantity::new(8),
+                type_: Type::Market,
+                side: Side::Bid,
+                ..order()
+            },
+            &mut log,
+        ));
+        let cheap_match = log
+            .iter()
+            .find_map(|event| {
+                event
+                    .as_match()
+                    .and_then(|match_| (match_.passive_order_id == cheap_id).then_some(match_))
+            })
+            .unwrap();
+        assert_eq!(
+            &transaction::Match {
+                active_order_id: bid_id,
+                passive_order_id: cheap_id,
+                price: Price::new(5),
+                quantity: Quantity::new(5),
+            },
+            cheap_match,
+        );
+        let expensive_match = log
+            .iter()
+            .find_map(|event| {
+                event
+                    .as_match()
+                    .and_then(|match_| (match_.passive_order_id == expensive_id).then_some(match_))
+            })
+            .unwrap();
+        assert_eq!(
+            &transaction::Match {
+                active_order_id: bid_id,
+                passive_order_id: expensive_id,
+                price: Price::new(6),
+                quantity: Quantity::new(3),
+            },
+            expensive_match,
+        );
+    }
+
+    #[test]
     fn stop_limit_order_is_added_to_book() {
+        // scenario: the orderbook is empty, a stop order comes in
+        //
+        // expected result: the stop order should be tracked by the book,
+        // but it should not be considered as executable/affect the price
+        // of its side.
         let mut book = Book::new();
         let id = Id::new(uuid::Uuid::new_v4());
         let price = Price::new(10);
+        let stop_price = Price::new(11);
         let side = Side::Bid;
         let type_ = Type::StopLimit;
         let order = Order {
             id,
             side,
             price,
+            stop_price,
             type_,
             ..order()
         };
-        let mut logs = transaction::Log::new();
+        let mut logs = Log::new();
         book.execute(order, &mut logs).unwrap();
-        logs.iter()
-            .find(|event| event.is_add())
-            .expect("there should be an event for adding the order to the book");
         assert_eq!(
-            Some(&(side, type_, price)),
+            Some(&(side, type_, stop_price)),
             book.get_order_meta(&id),
             "the orders should exist in the book"
         );
@@ -1051,6 +1256,45 @@ mod tests {
             book.best_price(&side),
             "there should not be a best bid price because the order is a stop order "
         );
+    }
+
+    #[test]
+    fn stop_limit_order_activates_on_limit_order() {
+        // scenario: an ask stop limit order sits in the order book with a stop price lower
+        // than its limit price. a limit order bid comes in at the same price as the stop price.
+        //
+        // expected result: the stop limit order becomes a limit order on the book. both orders now
+        // sit in the book. No matches between the two orders happen.
+        let mut book = Book::new();
+        let id = Id::new(uuid::Uuid::new_v4());
+        let mut log = Log::new();
+        book.execute(
+            Order {
+                id,
+                side: Side::Ask,
+                type_: Type::StopLimit,
+                price: Price::new(20),
+                stop_price: Price::new(10),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+        book.execute(
+            Order {
+                price: Price::new(15),
+                side: Side::Bid,
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+        crate::assert_some!(book.get_order(&id));
+        crate::assert_none!(
+            log.iter().find(|event| event.is_match()),
+            "no matches should have occured"
+        );
+        assert_eq!(Some(&Price::new(15)), book.best_price(&Side::Bid));
     }
 
     #[test]

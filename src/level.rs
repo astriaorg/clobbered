@@ -119,31 +119,31 @@ impl Level {
     {
         let level_price = self.price;
         'match_loop: for mut maker in &mut self.orders_mut() {
-            let mut quantity = Quantity::zero();
+            let mut quantity_exchanged = Quantity::zero();
             if taker.quantity() >= maker.quantity() {
-                quantity = taker.quantity().saturating_sub(maker.quantity());
-                taker.quantity = taker.quantity().saturating_sub(&quantity);
+                quantity_exchanged = *maker.quantity();
+                taker.quantity = taker.quantity().saturating_sub(&quantity_exchanged);
                 maker.quantity = Quantity::zero();
             } else if !maker.needs_full_execution() {
-                quantity = maker.quantity().saturating_sub(maker.quantity());
-                maker.quantity = maker.quantity().saturating_sub(&quantity);
+                quantity_exchanged = *taker.quantity();
+                maker.quantity = maker.quantity().saturating_sub(&quantity_exchanged);
                 taker.quantity = Quantity::zero();
             }
 
             // A match only happened if the amount exchanged isn't zero. This covers the
             // case where the maker needs full execution, i.e. all-or-none.
-            if !quantity.is_zero() {
-                log.push(transaction::Event::Match {
+            if !quantity_exchanged.is_zero() {
+                log.push(transaction::Match {
                     active_order_id: *taker.id(),
                     passive_order_id: *maker.id(),
                     price: level_price,
-                    quantity,
+                    quantity: quantity_exchanged,
                 });
             }
 
             if maker.is_filled() {
                 on_remove(&maker);
-                log.push(transaction::Event::Fill {
+                log.push(transaction::Fill {
                     id: *maker.id(),
                     side: *maker.side(),
                     unfilled_quantity: Quantity::zero(),

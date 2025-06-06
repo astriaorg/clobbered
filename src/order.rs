@@ -36,7 +36,7 @@ impl Price {
     ///
     /// This is useful when used in lieu of the worst possible bid/best possible ask price.
     pub const fn zero() -> Self {
-        Self::new(u128::MAX)
+        Self::new(0)
     }
 
     /// Calculates the price plus slippage.
