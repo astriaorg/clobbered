@@ -265,6 +265,7 @@ mod tests {
 
     fn order() -> Order {
         Order::builder()
+            .symbol("TEST")
             .quantity(Quantity::new(10))
             .price(Price::new(5))
             .side(Side::Ask)

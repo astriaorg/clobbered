@@ -2,6 +2,7 @@
 pub enum Error {
     NoPrice,
     NoSide,
+    NoSymbol,
     NoStopPrice,
 }
 
@@ -11,6 +12,32 @@ pub struct Id(uuid::Uuid);
 impl Id {
     pub fn new(uuid: uuid::Uuid) -> Self {
         Self(uuid)
+    }
+}
+
+/// A trading symbol identifier.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Symbol(String);
+
+impl Symbol {
+    pub fn new(symbol: String) -> Self {
+        Self(symbol)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Symbol {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for Symbol {
+    fn from(value: &str) -> Self {
+        Self::new(value.to_string())
     }
 }
 
@@ -218,6 +245,7 @@ pub enum TimeInForce {
 
 pub struct Builder {
     id: Id,
+    symbol: Option<Symbol>,
     type_: Type,
     time_in_force: TimeInForce,
     side: Option<Side>,
@@ -232,6 +260,7 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             id: Id::new(uuid::Uuid::nil()),
+            symbol: None,
             type_: Type::Limit,
             time_in_force: TimeInForce::GoodTillCanceled,
             side: None,
@@ -245,6 +274,13 @@ impl Builder {
 
     pub fn id(self, id: Id) -> Self {
         Self { id, ..self }
+    }
+
+    pub fn symbol<S: Into<Symbol>>(self, symbol: S) -> Self {
+        Self {
+            symbol: Some(symbol.into()),
+            ..self
+        }
     }
 
     pub fn type_(self, type_: Type) -> Self {
@@ -297,6 +333,7 @@ impl Builder {
     pub fn build(self) -> Result<Order, Error> {
         let Self {
             id,
+            symbol,
             type_,
             time_in_force,
             side,
@@ -307,6 +344,7 @@ impl Builder {
             post_only,
         } = self;
         let side = side.ok_or(Error::NoSide)?;
+        let symbol = symbol.ok_or(Error::NoSymbol)?;
         let price = price.ok_or(Error::NoPrice)?;
 
         // XXX: For stop orders The stop price must be set. Otherwise the value itself
@@ -323,6 +361,7 @@ impl Builder {
 
         Ok(Order {
             id,
+            symbol,
             type_,
             time_in_force,
             side,
@@ -340,6 +379,8 @@ impl Builder {
 pub struct Order {
     /// The ID assigned to the order upon entering the system.
     pub(crate) id: Id,
+    /// The symbol this order is for.
+    pub(crate) symbol: Symbol,
     // The type of order (market, limit, etc)
     //
     // NOTE: type is a reserved keyword in rust, hence we call this field type_.
@@ -381,6 +422,10 @@ impl Order {
 
     pub fn id(&self) -> &Id {
         &self.id
+    }
+
+    pub fn symbol(&self) -> &Symbol {
+        &self.symbol
     }
 
     pub fn price(&self) -> &Price {
@@ -520,7 +565,7 @@ mod tests {
     fn orders_must_have_a_side_set() {
         assert_eq!(
             Err(Error::NoSide),
-            Order::builder().price(Price::new(5)).build(),
+            Order::builder().symbol("BTC").price(Price::new(5)).build(),
         );
     }
 
@@ -528,7 +573,15 @@ mod tests {
     fn orders_must_have_a_price_set() {
         assert_eq!(
             Err(Error::NoPrice),
-            Order::builder().side(Side::Ask).build(),
+            Order::builder().symbol("BTC").side(Side::Ask).build(),
+        );
+    }
+
+    #[test]
+    fn orders_must_have_a_symbol_set() {
+        assert_eq!(
+            Err(Error::NoSymbol),
+            Order::builder().side(Side::Ask).price(Price::new(5)).build(),
         );
     }
 
@@ -537,6 +590,7 @@ mod tests {
         assert_eq!(
             Err(Error::NoStopPrice),
             Order::builder()
+                .symbol("BTC")
                 .type_(Type::Stop)
                 .price(Price::new(5))
                 .side(Side::Ask)
