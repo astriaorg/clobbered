@@ -646,12 +646,12 @@ impl Book {
     ///
     /// Returns if an order was removed (i.e. if an order of `key` was known by the system).
     pub fn cancel(&mut self, id: &order::Id, log: &mut transaction::Log) -> bool {
-        let Some((side, type_, price)) = self.id_to_side_and_price.get(id) else {
+        let Some((side, type_, price)) = self.id_to_side_and_price.remove(id) else {
             return false;
         };
         match side {
-            Side::Ask => self.asks.cancel(id, type_, price),
-            Side::Bid => self.bids.cancel(id, type_, price),
+            Side::Ask => self.asks.cancel(id, &type_, &price),
+            Side::Bid => self.bids.cancel(id, &type_, &price),
         }
         log.push(Event::Cancel { id: *id });
         true
@@ -1307,5 +1307,29 @@ mod tests {
             });
         }
         crate::assert_none!(price_to_levels.best_price());
+    }
+
+    #[test]
+    fn order_is_removed_after_cancel() {
+        let mut book = Book::new();
+        let id = Id::new(uuid::Uuid::new_v4());
+        let side = Side::Bid;
+        let price = Price::new(10);
+        crate::assert_ok!(book.execute(
+            Order {
+                id,
+                side,
+                price,
+                type_: Type::Limit,
+                ..order()
+            },
+            &mut Log::new(),
+        ));
+
+        book.cancel(&id, &mut Log::new());
+
+        assert!(!book.contains(&id));
+        crate::assert_none!(book.get_order(&id));
+        crate::assert_none!(book.best_price(&side));
     }
 }
