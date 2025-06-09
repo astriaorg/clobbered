@@ -60,18 +60,21 @@ cargo clippy
 
 ### Order Execution Flow
 
-1. Orders enter via `MatchEngine::add_order()` with their symbol
-2. Engine routes order to appropriate symbol's orderbook (creates if needed)
-3. Post-only orders are rejected if they would cross the market
-4. Executable orders are matched against the opposite side within the same symbol
-5. Remaining volume is added to the book (unless immediate execution required)
-6. Stop orders are activated if market price triggers them
-7. Full matching loop ensures all possible matches occur
+1. Orderbooks must be explicitly created via `MatchEngine::create_orderbook()`
+2. Orders enter via `MatchEngine::add_order()` with their symbol
+3. Engine routes order to appropriate symbol's orderbook (fails if not created)
+4. Post-only orders are rejected if they would cross the market
+5. Executable orders are matched against the opposite side within the same symbol
+6. Remaining volume is added to the book (unless immediate execution required)
+7. Stop orders are activated if market price triggers them
+8. Full matching loop ensures all possible matches occur
 
 ### Important Implementation Details
 
+- **Explicit Orderbook Creation**: Orderbooks must be created before orders can be added for a symbol
 - **Symbol Isolation**: Orders only match within the same symbol - no cross-symbol matching
 - **Order Builder**: All orders must specify a symbol via `Order::builder().symbol("BTC")`
+- **Unknown Symbol Handling**: Adding orders for non-existent symbols returns `ExecutionError::UnknownSymbol`
 - Orders with zero quantity are marked as filled but may remain in levels until cleanup
 - Price types (`AskPrice`/`BidPrice`) handle different sorting requirements automatically  
 - Stop orders use `stop_price` for activation, then become regular limit/market orders

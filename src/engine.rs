@@ -4,6 +4,7 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub enum ExecutionError {
     AddOrder(Box<crate::book::AddOrderError>),
+    UnknownSymbol(order::Symbol),
 }
 
 impl From<crate::book::AddOrderError> for ExecutionError {
@@ -30,10 +31,11 @@ impl MatchEngine {
     }
 
     /// Adds an order to the appropriate orderbook based on the order's symbol.
-    /// Creates a new orderbook for the symbol if it doesn't exist.
+    /// Returns an error if no orderbook exists for the symbol.
     pub fn add_order(&mut self, order: order::Order) -> Result<transaction::Log, ExecutionError> {
         let symbol = order.symbol().clone();
-        let orderbook = self.orderbooks.entry(symbol).or_insert_with(crate::book::Book::new);
+        let orderbook = self.orderbooks.get_mut(&symbol)
+            .ok_or_else(|| ExecutionError::UnknownSymbol(symbol))?;
         
         let mut log = transaction::Log::new();
         orderbook.execute(order, &mut log)?;
@@ -92,10 +94,16 @@ mod tests {
     }
 
     #[test]
-    fn engine_creates_orderbook_for_new_symbol() {
+    fn engine_requires_orderbook_creation_before_adding_orders() {
         let mut engine = MatchEngine::new();
         let btc_order = create_order("BTC", Side::Bid, 50000, 1);
         
+        // Should fail when orderbook doesn't exist
+        let result = engine.add_order(btc_order.clone());
+        assert!(matches!(result, Err(ExecutionError::UnknownSymbol(_))));
+        
+        // Create orderbook and try again
+        engine.create_orderbook(Symbol::from("BTC"));
         engine.add_order(btc_order).unwrap();
         
         assert!(engine.get_orderbook(&Symbol::from("BTC")).is_some());
@@ -105,6 +113,10 @@ mod tests {
     #[test]
     fn engine_handles_multiple_symbols() {
         let mut engine = MatchEngine::new();
+        
+        // Create orderbooks first
+        engine.create_orderbook(Symbol::from("BTC"));
+        engine.create_orderbook(Symbol::from("ETH"));
         
         let btc_order = create_order("BTC", Side::Bid, 50000, 1);
         let eth_order = create_order("ETH", Side::Ask, 3000, 5);
@@ -120,6 +132,10 @@ mod tests {
     #[test]
     fn orders_only_match_within_same_symbol() {
         let mut engine = MatchEngine::new();
+        
+        // Create orderbooks first
+        engine.create_orderbook(Symbol::from("BTC"));
+        engine.create_orderbook(Symbol::from("ETH"));
         
         // Add BTC ask order
         let btc_ask = create_order("BTC", Side::Ask, 50000, 1);
@@ -144,6 +160,9 @@ mod tests {
     #[test]
     fn cancel_order_searches_all_symbols() {
         let mut engine = MatchEngine::new();
+        
+        // Create orderbook first
+        engine.create_orderbook(Symbol::from("BTC"));
         
         let order_id = Id::new(Uuid::new_v4());
         let btc_order = Order::builder()
