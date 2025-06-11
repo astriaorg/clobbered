@@ -30,7 +30,7 @@ macro_rules! assert_none {
     ($cond:expr, $($arg:tt)+) => {
         match $cond {
             Some(t) => {
-                panic!("assertion failed, expected None, Some({t:?}): {}", format_args!($($arg)+));
+                panic!("assertion failed, expected None, got Some({t:?}): {}", format_args!($($arg)+));
             }
             None => {}
         }

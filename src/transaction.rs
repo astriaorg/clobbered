@@ -63,7 +63,7 @@ impl Event {
     }
 
     pub fn is_fill(&self) -> bool {
-        matches!(self, Event::Fill { .. })
+        matches!(self, Event::Fill(_))
     }
 
     pub fn is_match(&self) -> bool {
