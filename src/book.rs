@@ -306,7 +306,7 @@ impl HasSide for AskPrice {
 
     fn crosses<P>(&self, opposite: P) -> bool
     where
-        Self::OppositePrice: From<P>,
+        P: Into<Self::OppositePrice>,
     {
         let opposite: Self::OppositePrice = opposite.into();
         println!("{self:?} {opposite:?}");
@@ -327,7 +327,7 @@ impl HasSide for BidPrice {
 
     fn crosses<P>(&self, opposite: P) -> bool
     where
-        Self::OppositePrice: From<P>,
+        P: Into<Self::OppositePrice>,
     {
         let opposite: Self::OppositePrice = opposite.into();
         println!("{self:?} {opposite:?}");
