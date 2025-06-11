@@ -192,7 +192,7 @@ where
         }
         still_needed.is_zero()
     }
-    /// Creates an iterator over the levels of the this map.
+    /// Creates an iterator over the levels of this map.
     ///
     /// The levels are from best to worst (ascending if ask, descending if bid).
     fn levels(&self) -> impl Iterator<Item = (&TPrice, &Level)> {

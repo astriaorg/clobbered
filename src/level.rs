@@ -47,7 +47,7 @@ impl Level {
 
     /// Returns if the level contains any orders.
     ///
-    /// This is a cheap operation O(1) operation that checks an internal counter.
+    /// This is a cheap O(1) operation that checks an internal counter.
     pub(crate) fn has_volume(&self) -> bool {
         *self.orders_with_volume.borrow() != 0
     }
