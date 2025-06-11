@@ -795,7 +795,6 @@ impl Book {
             }
 
             'activate_asks: for (ask_price, stop_level) in self.asks.stop_orders.levels_mut() {
-                println!("{ask_price:?} {market_bid_price:?}");
                 if ask_price.is_worse_than(market_bid_price) {
                     break 'activate_asks;
                 }
@@ -883,7 +882,6 @@ impl Book {
                     match_happened |= log.events.len() > events_before;
                 }
             }
-            println!("have stop bid matches happened: {match_happened}");
 
             // then, execute all asks
             // TODO: streamline both of these loops to avoid all that duplicate logic.
@@ -918,13 +916,9 @@ impl Book {
                 }
             }
 
-            println!("have ask bid matches happened: {match_happened}");
-
             let events_before = log.events.len();
             self.activate_stop_orders(log);
             match_happened |= log.events.len() > events_before;
-
-            println!("have activation matches happened: {match_happened}");
 
             if !match_happened {
                 break 'full_match;
