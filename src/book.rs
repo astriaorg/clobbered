@@ -309,8 +309,7 @@ impl HasSide for AskPrice {
         P: Into<Self::OppositePrice>,
     {
         let opposite: Self::OppositePrice = opposite.into();
-        println!("{self:?} {opposite:?}");
-        dbg!(self.0 <= opposite.0)
+        self.0 <= opposite.0
     }
 }
 
@@ -330,8 +329,7 @@ impl HasSide for BidPrice {
         P: Into<Self::OppositePrice>,
     {
         let opposite: Self::OppositePrice = opposite.into();
-        println!("{self:?} {opposite:?}");
-        dbg!(self.0 >= opposite.0)
+        self.0 >= opposite.0
     }
 }
 
