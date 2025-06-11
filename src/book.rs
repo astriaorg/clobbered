@@ -278,7 +278,7 @@ impl From<BidPrice> for Price {
     }
 }
 
-trait HasSide: std::fmt::Debug {
+trait HasSide {
     type OppositePrice: HasSide;
 
     fn side() -> Side;
@@ -552,7 +552,7 @@ where
 
 impl<TPrice> Half<TPrice>
 where
-    TPrice: From<Price> + Ord + std::fmt::Debug,
+    TPrice: From<Price> + Ord,
 {
     /// Adds an order to the halfbook.
     fn add_order_unchecked(&mut self, order: order::Order) {
