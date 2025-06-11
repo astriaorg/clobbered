@@ -60,6 +60,7 @@ where
 impl<TPrice> PriceToLevel<TPrice>
 where
     TPrice: HasSide + Ord,
+    TPrice::OppositePrice: From<Price>,
 {
     fn is_crossed_by(&self, order: &order::Order) -> bool {
         debug_assert_eq!(self.side, order.side().opposite());
@@ -69,7 +70,7 @@ where
             } else {
                 order.price()
             };
-            best_price.is_worse_than(order_price)
+            best_price.crosses(*order_price)
         } else {
             false
         }
@@ -117,6 +118,7 @@ where
 impl<TPrice> PriceToLevel<TPrice>
 where
     TPrice: Ord + HasSide,
+    TPrice::OppositePrice: From<Price>,
 {
     /// Checks if the halfbook has enough volume at `price` or better to fill the `requested` amount.
     fn has_enough_volume_at_price_or_better(
@@ -126,7 +128,7 @@ where
     ) -> bool {
         let mut still_needed = *requested;
         'levels: for (level_price, level) in self.levels() {
-            if level_price.is_worse_than(price) {
+            if level_price.crosses(*price) {
                 break 'levels;
             }
             for order in level.orders() {
@@ -277,16 +279,23 @@ impl From<BidPrice> for Price {
 }
 
 trait HasSide {
+    type OppositePrice: HasSide;
+
     fn side() -> Side;
 
     fn worst_possible() -> Self;
 
-    fn is_worse_than<P>(&self, price: P) -> bool
+    fn crosses<P>(&self, opposite: P) -> bool
     where
-        P: AsRef<Price>;
+        // TODO: this exists so that one does not need to explicitly convert Price -> Ask/BidPrice everywhere.
+        // This will likely only be implemented as crosses::<AskPrice> and crosses::<BidPrice>, but there might
+        // be a way to write this in a nicer way.
+        Self::OppositePrice: From<P>;
 }
 
 impl HasSide for AskPrice {
+    type OppositePrice = BidPrice;
+
     fn side() -> Side {
         Side::Ask
     }
@@ -295,15 +304,18 @@ impl HasSide for AskPrice {
         Self::from(order::Price::max())
     }
 
-    fn is_worse_than<P>(&self, price: P) -> bool
+    fn crosses<P>(&self, opposite: P) -> bool
     where
-        P: AsRef<Price>,
+        P: Into<Self::OppositePrice>,
     {
-        self.as_ref() > price.as_ref()
+        let opposite: Self::OppositePrice = opposite.into();
+        self.0 <= opposite.0
     }
 }
 
 impl HasSide for BidPrice {
+    type OppositePrice = AskPrice;
+
     fn side() -> Side {
         Side::Bid
     }
@@ -312,11 +324,12 @@ impl HasSide for BidPrice {
         Self::from(order::Price::zero())
     }
 
-    fn is_worse_than<P>(&self, price: P) -> bool
+    fn crosses<P>(&self, opposite: P) -> bool
     where
-        P: AsRef<Price>,
+        P: Into<Self::OppositePrice>,
     {
-        self.as_ref() < price.as_ref()
+        let opposite: Self::OppositePrice = opposite.into();
+        self.0 >= opposite.0
     }
 }
 
@@ -411,6 +424,7 @@ where
 impl<TPrice> Half<TPrice>
 where
     TPrice: AsRef<Price> + Copy + From<Price> + HasSide + Ord,
+    TPrice::OppositePrice: From<Price>,
 {
     /// Executes `order` against the boo.
     ///
@@ -502,6 +516,7 @@ where
 impl<TPrice> Half<TPrice>
 where
     TPrice: HasSide + Ord,
+    TPrice::OppositePrice: From<Price>,
 {
     fn is_crossed_by(&self, order: &order::Order) -> bool {
         debug_assert_eq!(self.side, order.side().opposite());
@@ -522,6 +537,7 @@ where
 impl<TPrice> Half<TPrice>
 where
     TPrice: Ord + HasSide,
+    TPrice::OppositePrice: From<Price>,
 {
     /// Checks if the halfbook has enough volume at `price` or better to fill the `requested` amount.
     fn has_enough_volume_at_price_or_better(
@@ -536,7 +552,7 @@ where
 
 impl<TPrice> Half<TPrice>
 where
-    TPrice: From<Price> + Ord + std::fmt::Debug,
+    TPrice: From<Price> + Ord,
 {
     /// Adds an order to the halfbook.
     fn add_order_unchecked(&mut self, order: order::Order) {
@@ -760,7 +776,7 @@ impl Book {
             let mut have_activations_happened_on_iteration = false;
 
             'activate_bids: for (bid_price, stop_level) in self.bids.stop_orders.levels_mut() {
-                if bid_price.is_worse_than(market_ask_price) {
+                if !bid_price.crosses(market_ask_price) {
                     break 'activate_bids;
                 }
 
@@ -795,7 +811,7 @@ impl Book {
             }
 
             'activate_asks: for (ask_price, stop_level) in self.asks.stop_orders.levels_mut() {
-                if ask_price.is_worse_than(market_bid_price) {
+                if !ask_price.crosses(market_bid_price) {
                     break 'activate_asks;
                 }
 
@@ -861,7 +877,7 @@ impl Book {
                     break 'match_bids;
                 };
                 'loop_bids: for (bid_price, bid_level) in &mut self.bids.levels.levels_mut() {
-                    if bid_price.is_worse_than(best_ask_price) {
+                    if !bid_price.crosses(best_ask_price) {
                         break 'loop_bids;
                     }
                     let events_before = log.events.len();
@@ -894,7 +910,7 @@ impl Book {
                     break 'match_asks;
                 };
                 'loop_bids: for (ask_price, ask_level) in self.asks.levels.levels_mut() {
-                    if ask_price.is_worse_than(best_bid_price) {
+                    if !ask_price.crosses(best_bid_price) {
                         break 'loop_bids;
                     }
                     let events_before = log.events.len();
@@ -947,6 +963,8 @@ fn make_remove_fn(
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::{AskPrice, BidPrice, Book, HasSide, PriceToLevel};
     use crate::{
         order::{Id, Order, Price, Quantity, Side, Type},
@@ -955,6 +973,7 @@ mod tests {
 
     fn order() -> Order {
         Order::builder()
+            .id(Id::new(Uuid::new_v4()))
             .quantity(Quantity::new(10))
             .price(Price::new(5))
             .side(Side::Ask)
@@ -963,24 +982,20 @@ mod tests {
     }
 
     #[test]
-    fn are_prices_better_than() {
+    fn are_prices_crossing() {
         let five = Price::new(5);
         let ten = Price::new(10);
-        assert!(AskPrice::from(ten).is_worse_than(five));
-        assert!(AskPrice::from(ten).is_worse_than(AskPrice::from(five)));
-        assert!(AskPrice::from(ten).is_worse_than(BidPrice::from(five)));
+        assert!(!AskPrice::from(ten).crosses(five));
+        assert!(!AskPrice::from(ten).crosses(BidPrice::from(five)));
 
-        assert!(!AskPrice::from(five).is_worse_than(ten));
-        assert!(!AskPrice::from(five).is_worse_than(AskPrice::from(ten)));
-        assert!(!AskPrice::from(five).is_worse_than(BidPrice::from(ten)));
+        assert!(AskPrice::from(five).crosses(ten));
+        assert!(AskPrice::from(five).crosses(BidPrice::from(ten)));
 
-        assert!(BidPrice::from(five).is_worse_than(ten));
-        assert!(BidPrice::from(five).is_worse_than(AskPrice::from(ten)));
-        assert!(BidPrice::from(five).is_worse_than(BidPrice::from(ten)));
+        assert!(!BidPrice::from(five).crosses(ten));
+        assert!(!BidPrice::from(five).crosses(AskPrice::from(ten)));
 
-        assert!(!BidPrice::from(ten).is_worse_than(five));
-        assert!(!BidPrice::from(ten).is_worse_than(AskPrice::from(five)));
-        assert!(!BidPrice::from(ten).is_worse_than(BidPrice::from(five)));
+        assert!(BidPrice::from(ten).crosses(five));
+        assert!(BidPrice::from(ten).crosses(AskPrice::from(five)));
     }
 
     #[test]
@@ -1301,5 +1316,275 @@ mod tests {
             });
         }
         crate::assert_none!(price_to_levels.best_price());
+    }
+
+    #[test]
+    fn ask_order_does_not_cross_empty_book() {
+        // scenario: empty book, ask order comes in
+        //
+        // expected result: ask order does not cross the market (no bids to cross)
+        let book = Book::new();
+        let ask_order = Order {
+            side: Side::Ask,
+            price: Price::new(100),
+            ..order()
+        };
+        assert!(!book.does_order_cross_market(&ask_order));
+    }
+
+    #[test]
+    fn bid_order_does_not_cross_empty_book() {
+        // scenario: empty book, bid order comes in
+        //
+        // expected result: bid order does not cross the market (no asks to cross)
+        let book = Book::new();
+        let bid_order = Order {
+            side: Side::Bid,
+            price: Price::new(100),
+            ..order()
+        };
+        assert!(!book.does_order_cross_market(&bid_order));
+    }
+
+    #[test]
+    fn ask_order_crosses_market_with_higher_bid() {
+        // scenario: bid at 100 on book, ask order comes in at 90
+        //
+        // expected result: ask order crosses the market (ask price < bid price)
+        let mut book = Book::new();
+        let mut log = Log::new();
+        book.execute(
+            Order {
+                side: Side::Bid,
+                price: Price::new(100),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+
+        let ask_order = Order {
+            side: Side::Ask,
+            price: Price::new(90),
+            ..order()
+        };
+        assert!(book.does_order_cross_market(&ask_order));
+    }
+
+    #[test]
+    fn ask_order_crosses_market_at_equal_price() {
+        // scenario: bid at 100 on book, ask order comes in at 100
+        //
+        // expected result: ask order crosses the market (ask price = bid price)
+        let mut book = Book::new();
+        let mut log = Log::new();
+        book.execute(
+            Order {
+                side: Side::Bid,
+                price: Price::new(100),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+
+        let ask_order = Order {
+            side: Side::Ask,
+            price: Price::new(100),
+            ..order()
+        };
+        assert!(book.does_order_cross_market(&ask_order));
+    }
+
+    #[test]
+    fn ask_order_does_not_cross_market_with_lower_bid() {
+        // scenario: bid at 100 on book, ask order comes in at 110
+        //
+        // expected result: ask order should NOT cross (ask price > bid price)
+        let mut book = Book::new();
+        let mut log = Log::new();
+        book.execute(
+            Order {
+                side: Side::Bid,
+                price: Price::new(100),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+
+        let ask_order = Order {
+            side: Side::Ask,
+            price: Price::new(110),
+            ..order()
+        };
+        // Testing current implementation behavior
+        assert!(!book.does_order_cross_market(&ask_order));
+    }
+
+    #[test]
+    fn bid_order_crosses_market_with_lower_ask() {
+        // scenario: ask at 100 on book, bid order comes in at 110
+        //
+        // expected result: bid order crosses the market (bid price > ask price)
+        let mut book = Book::new();
+        let mut log = Log::new();
+        book.execute(
+            Order {
+                side: Side::Ask,
+                price: Price::new(100),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+
+        let bid_order = Order {
+            side: Side::Bid,
+            price: Price::new(110),
+            ..order()
+        };
+        assert!(book.does_order_cross_market(&bid_order));
+    }
+
+    #[test]
+    fn bid_order_crosses_market_at_equal_price() {
+        // scenario: ask at 100 on book, bid order comes in at 100
+        //
+        // expected result: bid order crosses the market (bid price = ask price)
+        let mut book = Book::new();
+        let mut log = Log::new();
+        book.execute(
+            Order {
+                side: Side::Ask,
+                price: Price::new(100),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+
+        let bid_order = Order {
+            side: Side::Bid,
+            price: Price::new(100),
+            ..order()
+        };
+        assert!(book.does_order_cross_market(&bid_order));
+    }
+
+    #[test]
+    fn bid_order_does_not_cross_market_with_higher_ask() {
+        // scenario: ask at 100 on book, bid order comes in at 90
+        //
+        // expected result: bid order should NOT cross (bid price < ask price)
+        let mut book = Book::new();
+        let mut log = Log::new();
+        book.execute(
+            Order {
+                side: Side::Ask,
+                price: Price::new(100),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+
+        let bid_order = Order {
+            side: Side::Bid,
+            price: Price::new(90),
+            ..order()
+        };
+        // Testing current implementation behavior
+        assert!(!book.does_order_cross_market(&bid_order));
+    }
+
+    #[test]
+    fn ask_order_crosses_market_with_multiple_bids() {
+        // scenario: multiple bids on book (90, 95, 100), ask order comes in at 92
+        //
+        // expected result: ask order crosses the market (crosses the best bid at 100)
+        let mut book = Book::new();
+        let mut log = Log::new();
+
+        // Add multiple bids
+        book.execute(
+            Order {
+                side: Side::Bid,
+                price: Price::new(90),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+        book.execute(
+            Order {
+                side: Side::Bid,
+                price: Price::new(95),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+        book.execute(
+            Order {
+                side: Side::Bid,
+                price: Price::new(100),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+
+        let ask_order = Order {
+            side: Side::Ask,
+            price: Price::new(92),
+            ..order()
+        };
+        assert!(book.does_order_cross_market(&ask_order));
+    }
+
+    #[test]
+    fn bid_order_crosses_market_with_multiple_asks() {
+        // scenario: multiple asks on book (100, 105, 110), bid order comes in at 108
+        //
+        // expected result: bid order crosses the market (crosses the best ask at 100)
+        let mut book = Book::new();
+        let mut log = Log::new();
+
+        // Add multiple asks
+        book.execute(
+            Order {
+                side: Side::Ask,
+                price: Price::new(100),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+        book.execute(
+            Order {
+                side: Side::Ask,
+                price: Price::new(105),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+        book.execute(
+            Order {
+                side: Side::Ask,
+                price: Price::new(110),
+                ..order()
+            },
+            &mut log,
+        )
+        .unwrap();
+
+        let bid_order = Order {
+            side: Side::Bid,
+            price: Price::new(108),
+            ..order()
+        };
+        assert!(book.does_order_cross_market(&bid_order));
     }
 }
