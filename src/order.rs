@@ -499,7 +499,7 @@ impl Order {
 
     /// Returns if the order has volume, that is if its quantity is not zero.
     ///
-    /// This is the inerse of [`Order::is_filled`].
+    /// This is the inverse of [`Order::is_filled`].
     pub fn has_volume(&self) -> bool {
         self.quantity != Quantity::zero()
     }

@@ -192,14 +192,14 @@ where
         }
         still_needed.is_zero()
     }
-    /// Crates an iterator over the levels of the this map.
+    /// Creates an iterator over the levels of this map.
     ///
     /// The levels are from best to worst (ascending if ask, descending if bid).
     fn levels(&self) -> impl Iterator<Item = (&TPrice, &Level)> {
         self.inner.iter()
     }
 
-    /// Crates an iterator over the mutable levels of the this map.
+    /// Creates an iterator over the mutable levels of the this map.
     ///
     /// The levels are from best to worst (ascending if ask, descending if bid).
     fn levels_mut(&mut self) -> impl Iterator<Item = (&TPrice, &mut Level)> {
@@ -426,7 +426,7 @@ where
     TPrice: AsRef<Price> + Copy + From<Price> + HasSide + Ord,
     TPrice::OppositePrice: From<Price>,
 {
-    /// Executes `order` against the boo.
+    /// Executes `order` against the book.
     ///
     /// If `order` is a stop order, then this method will
     /// also convert it to an executable order (market, limit, etc),
@@ -759,7 +759,7 @@ impl Book {
         // at their set price while later stop-limit orders won't get filled at all
         // but stil end up in the book as executable orders. But this seems to
         // be an intuitive mode of operation: the market did drop below a certain
-        // price point but now does not have enough liquidity to accomadate the
+        // price point but now does not have enough liquidity to accommodate the
         // stop-limit orders.
         let market_ask_price = self
             .asks
