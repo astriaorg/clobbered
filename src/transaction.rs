@@ -12,6 +12,11 @@ impl Log {
         Self { events: vec![] }
     }
 
+    /// Returns if the log contains not events.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     pub(crate) fn push<T>(&mut self, event: T)
     where
         Event: From<T>,
@@ -30,7 +35,7 @@ pub enum Event {
     // FIXME: maybe adding a "Modify" variant and putting it in there together with other modifiers would be sufficient?:w
     Activate(order::Order),
     Add(order::Order),
-    Cancel { id: order::Id },
+    Cancel(Cancel),
     Fill(Fill),
     Match(Match),
 }
@@ -39,6 +44,13 @@ impl Event {
     pub fn as_add(&self) -> Option<&order::Order> {
         match self {
             Self::Add(order) => Some(order),
+            _ => None,
+        }
+    }
+
+    pub fn as_cancel(&self) -> Option<&Cancel> {
+        match self {
+            Event::Cancel(cancel) => Some(cancel),
             _ => None,
         }
     }
@@ -62,12 +74,27 @@ impl Event {
         matches!(self, Event::Add(_))
     }
 
+    pub fn is_cancel(&self) -> bool {
+        matches!(self, Event::Cancel(_))
+    }
+
     pub fn is_fill(&self) -> bool {
         matches!(self, Event::Fill(_))
     }
 
     pub fn is_match(&self) -> bool {
         matches!(self, Event::Match(..))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Cancel {
+    pub id: order::Id,
+}
+
+impl From<Cancel> for Event {
+    fn from(value: Cancel) -> Self {
+        Self::Cancel(value)
     }
 }
 
