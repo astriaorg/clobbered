@@ -12,7 +12,7 @@ impl Log {
         Self { events: vec![] }
     }
 
-    /// Returns if the log contains not events.
+    /// Returns `true` the log contains no events.
     pub(crate) fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
