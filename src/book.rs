@@ -822,7 +822,7 @@ impl Book {
                         &mut ask,
                         log,
                         // XXX: need to construct the callback closure in the loop because we need to be able to insert the stop order into the map right after.
-                        &mut make_remove_fn(&mut self.id_to_side_and_price),
+                        make_remove_fn(&mut self.id_to_side_and_price),
                     );
 
                     if ask.is_filled() || ask.is_immediate() {
