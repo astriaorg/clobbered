@@ -660,16 +660,16 @@ impl Book {
 
     /// Cancels an order identified by its `id`.
     ///
-    /// Returns if an order was removed (i.e. if an order of `key` was known by the system).
+    /// Returns if an order was removed.
     pub fn cancel(&mut self, id: &order::Id, log: &mut transaction::Log) -> bool {
-        let Some((side, type_, price)) = self.id_to_side_and_price.get(id) else {
+        let Some((side, type_, price)) = self.id_to_side_and_price.remove(id) else {
             return false;
         };
         match side {
-            Side::Ask => self.asks.cancel(id, type_, price),
-            Side::Bid => self.bids.cancel(id, type_, price),
+            Side::Ask => self.asks.cancel(id, &type_, &price),
+            Side::Bid => self.bids.cancel(id, &type_, &price),
         }
-        log.push(Event::Cancel { id: *id });
+        log.push(transaction::Cancel { id: *id });
         true
     }
 
@@ -968,7 +968,7 @@ mod tests {
     use super::{AskPrice, BidPrice, Book, HasSide, PriceToLevel};
     use crate::{
         order::{Id, Order, Price, Quantity, Side, Type},
-        transaction::{self, Fill, Log},
+        transaction::{self, Event, Fill, Log},
     };
 
     fn order() -> Order {
@@ -1586,5 +1586,51 @@ mod tests {
             ..order()
         };
         assert!(book.does_order_cross_market(&bid_order));
+    }
+
+    #[test]
+    fn cancel_order_removes_from_book() {
+        // scenario: add an order to the book, cancel it.
+        //
+        // expected result: the operation returns the the order was cancelled.
+        // A cancellation event is found in the log. A subsequent cancel returns
+        // that no order was cancelled.
+        let mut book = Book::new();
+        let mut log = Log::new();
+
+        let order_id = Id::new(uuid::Uuid::new_v4());
+
+        let order = Order {
+            id: order_id,
+            ..order()
+        };
+        book.execute(order, &mut log).unwrap();
+
+        assert!(book.cancel(&order_id, &mut log));
+        assert!(!book.contains(&order_id));
+
+        crate::assert_some!(log.iter().find(|event| {
+            event
+                .as_cancel()
+                .is_some_and(|cancel| cancel.id == order_id)
+        }));
+
+        assert!(
+            !book.cancel(&order_id, &mut log),
+            "second cancel should return false"
+        );
+    }
+
+    #[test]
+    fn cancel_nonexistent_order_returns_false() {
+        // scenario: attempt to cancel an order that was never added to the book
+        //
+        // expected result: cancel returns false and no events are logged
+        let mut book = Book::new();
+        let mut log = Log::new();
+        let nonexistent_id = Id::new(uuid::Uuid::new_v4());
+
+        assert!(!book.cancel(&nonexistent_id, &mut log));
+        assert!(log.is_empty());
     }
 }
