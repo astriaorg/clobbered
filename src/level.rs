@@ -10,25 +10,40 @@ use crate::order::Side;
 use crate::transaction;
 
 /// A price-level in an orderbook.
+///
+/// It's implemented using a flat vector of orders to be cache efficient. Orders
+/// are removed as in a FIFO queue: older orders get priority over newer orders
+/// and are popped first. To not trigger memcpy's on pop, cancel, or fill,
+/// orders with zero volume are treated as holes (inspired by `Vec<Option<T>>`
+/// or the crates `stable-vec` and `slotmap`, but much simpler).
+///
+/// # Changing order volume and cancelling orders
+///
+/// The only crate-level API to manipulate order volume
+/// that is exposed at the crate level is  [`Level::orders_mut`].
+/// It yields an [`Entry`] object through which an order's volume
+/// can be manipulated. On drop, [`Entry`] will decrement a
+/// level-internal counter tracking orders with volumes. It is critical
+/// that this invariant is held up if new methods to manipulate order
+/// quantity are introduced, because it is used to determine if a price-level
+/// should be dropped from a the orderbook.
 #[derive(Debug)]
 pub(crate) struct Level {
     /// The side that this level is on.
     side: Side,
     /// The price which this levels applies to.
     price: Price,
-    /// The deque is optimal for adding at the front and pushing
-    /// at the back (so, the primary operations performed at a level).
+    /// A flat vector of orders to make iteration cache efficient.
+    /// Orders are removed by setting their volume to zero. Volumes
+    /// with zero volume are skipped and considered removed from the
+    /// backing storage.
     ///
-    /// Removing a element from the middle of the deque is (i.e. element at index i): O(min(i, n-i)).
-    /// This is why it *should* be better than a vec.
-    ///
-    /// However, it should be investigated what the actually best datastructure would be.
-    ///
-    /// TODO: investigate if this should be replaced by a BTreeSet
-    /// or Vec or VecDeque (or even IndexMap). All depends on the optimal performance
-    /// for the different operations.
+    /// Lookup and removal at the front are O(1). Lookup and removal
+    /// are O(n) because the vector has to be iterated.
     inner: Vec<Order>,
 
+    /// Tracks the number of orders that have volume. Uses a RefCell because
+    /// to decrement this counter when mutably iterating through orders.
     orders_with_volume: RefCell<usize>,
 }
 
@@ -80,20 +95,19 @@ impl Level {
     pub(crate) fn push(&mut self, order: Order) {
         debug_assert_eq!(&self.side, order.side());
         if order.has_volume() {
-            self.orders_with_volume
-                .replace_with(|old| old.saturating_add(1));
+            self.orders_with_volume.replace_with(|old| {
+                old.checked_add_signed(1).expect(
+                    "orders-with-volume counter overflowed; this would require usize::MAX \
+                        orders to be in the level, which in practice should never happen",
+                )
+            });
         }
         self.inner.push(order);
     }
 
     /// Returns the order identified by `id` if it exists at this level.
     pub(crate) fn get(&self, id: &order::Id) -> Option<&Order> {
-        for order in self.orders() {
-            if order.id() == id {
-                return Some(order);
-            }
-        }
-        None
+        self.orders().find(|order| order.id() == id)
     }
 
     /// Cancels the order identified by `id`.
@@ -228,12 +242,7 @@ impl<'level> Iterator for Orders<'level> {
     type Item = &'level Order;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for order in &mut self.iter {
-            if order.has_volume() {
-                return Some(order);
-            }
-        }
-        None
+        self.iter.find(|order| order.has_volume())
     }
 }
 
