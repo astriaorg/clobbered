@@ -466,9 +466,7 @@ where
         match order.type_ {
             order::Type::Stop => {
                 order.type_ = order::Type::Market;
-                if order.has_slippage() {
-                    market_price = *order.stop_price();
-                } else {
+                if !order.has_slippage() {
                     market_price = *TPrice::worst_possible().as_ref();
                 }
             }
