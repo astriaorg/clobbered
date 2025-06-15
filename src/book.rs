@@ -1,4 +1,8 @@
-use crate::{level::Level, order::Side, transaction::Event};
+use crate::{
+    level::Level,
+    order::{Side, Slippage},
+    transaction::Event,
+};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::{
@@ -423,7 +427,7 @@ where
 
 impl<TPrice> Half<TPrice>
 where
-    TPrice: AsRef<Price> + Copy + From<Price> + HasSide + Ord,
+    TPrice: AsRef<Price> + Copy + From<Price> + Into<Price> + HasSide + Ord,
     TPrice::OppositePrice: From<Price>,
 {
     /// Executes `order` against the book.
@@ -452,23 +456,11 @@ where
     {
         debug_assert_eq!(self.side, order.side().opposite());
 
-        // XXX: use the worst possible price here to line up the types.
-        // In practice this won't do anything because if there is no
-        // best price then there are no orders to match against.
-        let mut market_price = *self
-            .best_price()
-            .copied()
-            .unwrap_or_else(TPrice::worst_possible)
-            .as_ref();
-
         // Performs the conversion of stop order to executable order.
         let was_stop = order.is_stop();
         match order.type_ {
             order::Type::Stop => {
                 order.type_ = order::Type::Market;
-                if !order.has_slippage() {
-                    market_price = *TPrice::worst_possible().as_ref();
-                }
             }
             order::Type::StopLimit => {
                 order.type_ = order::Type::Limit;
@@ -476,12 +468,25 @@ where
             _ => {}
         }
 
-        if was_stop {
-            log.push(Event::Activate(order.clone()));
+        if order.is_market() {
+            let order_price = if let Some(slippage) = order.slippage() {
+                let market_price: Price = self
+                    .best_price()
+                    .copied()
+                    .unwrap_or_else(TPrice::worst_possible)
+                    .into();
+                match order.side() {
+                    Side::Ask => market_price.minus_slippage(slippage),
+                    Side::Bid => market_price.plus_slippage(slippage),
+                }
+            } else {
+                TPrice::worst_possible().into()
+            };
+            order.set_price(order_price);
         }
 
-        if order.is_market() {
-            order.set_market_price_considering_slippage(&market_price);
+        if was_stop {
+            log.push(Event::Activate(order.clone()));
         }
 
         if order.needs_full_execution()
