@@ -468,28 +468,9 @@ impl Order {
         self.type_.is_stop()
     }
 
-    /// Sets the market price of the order, taking into accounts its side and slippage setting.
-    ///
-    /// If the order does not have slippage set, then its market price will be set to the maximum
-    /// possible value (maximum if a bid, minimum if an ask). If it has slippage set, then its
-    /// market price will be set to `market_price +/- slippage` (the slippage is added if a bid,
-    /// subtracted if an ask).
-    ///
-    /// The caller is responsible for ensuring that the order is indeed a market order because
-    /// this call otherwise does not make sense.
-    pub fn set_market_price_considering_slippage(&mut self, market_price: &Price) {
-        let order_price = if let Some(slippage) = self.slippage {
-            match self.side {
-                Side::Ask => market_price.minus_slippage(&slippage),
-                Side::Bid => market_price.plus_slippage(&slippage),
-            }
-        } else {
-            match self.side {
-                Side::Ask => Price::zero(),
-                Side::Bid => Price::max(),
-            }
-        };
-        self.price = order_price;
+    /// Sets the order price to [`price`].
+    pub fn set_price(&mut self, price: Price) {
+        self.price = price;
     }
 
     /// Returns if the order has slippage set.
