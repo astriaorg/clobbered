@@ -427,7 +427,7 @@ where
 
 impl<TPrice> Half<TPrice>
 where
-    TPrice: AsRef<Price> + Copy + From<Price> + Into<Price> + HasSide + Ord,
+    TPrice: AsRef<Price> + Copy + Into<Price> + HasSide + Ord,
     TPrice::OppositePrice: From<Price>,
 {
     /// Executes `order` against the book.
