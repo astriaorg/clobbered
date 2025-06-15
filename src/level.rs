@@ -42,7 +42,7 @@ pub(crate) struct Level {
     /// are O(n) because the vector has to be iterated.
     inner: Vec<Order>,
 
-    /// Tracks the number of orders that have volume. Uses a RefCell to allow
+    /// Tracks the number of orders that have volume. Uses a `RefCell` to allow
     /// mutable access to this counter when decrementing it during mutable
     /// iteration through orders.
     orders_with_volume: RefCell<usize>,
