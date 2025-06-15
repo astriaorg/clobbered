@@ -26,7 +26,7 @@ use crate::transaction;
 /// level-internal counter tracking orders with volumes. It is critical
 /// that this invariant is held up if new methods to manipulate order
 /// quantity are introduced, because it is used to determine if a price-level
-/// should be dropped from a the orderbook.
+/// should be dropped from the orderbook.
 #[derive(Debug)]
 pub(crate) struct Level {
     /// The side that this level is on.
@@ -42,8 +42,9 @@ pub(crate) struct Level {
     /// are O(n) because the vector has to be iterated.
     inner: Vec<Order>,
 
-    /// Tracks the number of orders that have volume. Uses a RefCell because
-    /// to decrement this counter when mutably iterating through orders.
+    /// Tracks the number of orders that have volume. Uses a RefCell to allow
+    /// mutable access to this counter when decrementing it during mutable
+    /// iteration through orders.
     orders_with_volume: RefCell<usize>,
 }
 
