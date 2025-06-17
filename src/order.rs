@@ -48,7 +48,7 @@ pub struct Symbol(tinystr::TinyAsciiStr<8>);
 
 impl Symbol {
     /// Creates a new symbol from a string slice.
-    pub fn new(s: &str) -> Result<Self, Error> {
+    pub fn try_from_str(s: &str) -> Result<Self, Error> {
         let tiny_str = tinystr::TinyAsciiStr::try_from_str(s).map_err(Error::invalid_symbol)?;
         Ok(Self(tiny_str))
     }
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(
             Err(Error::no_side()),
             Order::builder()
-                .symbol(Symbol::new("BTCUSD").unwrap())
+                .symbol(Symbol::try_from_str("BTCUSD").unwrap())
                 .price(Price::new(5))
                 .build(),
         );
@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(
             Err(Error::no_price()),
             Order::builder()
-                .symbol(Symbol::new("BTCUSD").unwrap())
+                .symbol(Symbol::try_from_str("BTCUSD").unwrap())
                 .side(Side::Ask)
                 .build(),
         );
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(
             Err(Error::no_stop_price()),
             Order::builder()
-                .symbol(Symbol::new("BTCUSD").unwrap())
+                .symbol(Symbol::try_from_str("BTCUSD").unwrap())
                 .type_(Type::Stop)
                 .price(Price::new(5))
                 .side(Side::Ask)

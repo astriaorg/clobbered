@@ -275,7 +275,7 @@ mod tests {
 
     fn order() -> Order {
         Order::builder()
-            .symbol(Symbol::new("BTCUSD").unwrap())
+            .symbol(Symbol::try_from_str("BTCUSD").unwrap())
             .quantity(Quantity::new(10))
             .price(Price::new(5))
             .side(Side::Ask)

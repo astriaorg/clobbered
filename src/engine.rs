@@ -54,13 +54,10 @@ mod tests {
     #[test]
     fn rejects_orders_for_unknown_symbols() {
         let mut engine = MatchEngine::new();
-        let btc_symbol = Symbol::new("BTCUSD").unwrap();
-        let eth_symbol = Symbol::new("ETHUSD").unwrap();
+        let btc_symbol = Symbol::try_from_str("BTCUSD").unwrap();
+        let eth_symbol = Symbol::try_from_str("ETHUSD").unwrap();
         
-        // Add orderbook for BTC only
         engine.add_orderbook(btc_symbol);
-        
-        // BTC order should succeed
         let btc_order = order::Order::builder()
             .id(Id::new(Uuid::new_v4()))
             .symbol(btc_symbol)
@@ -70,9 +67,7 @@ mod tests {
             .build()
             .unwrap();
         
-        assert!(engine.add_order(btc_order).is_ok());
-        
-        // ETH order should fail with UnknownSymbol
+        crate::assert_ok!(engine.add_order(btc_order));
         let eth_order = order::Order::builder()
             .id(Id::new(Uuid::new_v4()))
             .symbol(eth_symbol)
@@ -82,6 +77,7 @@ mod tests {
             .build()
             .unwrap();
         
+        // TODO: Replace this match with claim::assert_err! macro (https://github.com/astriaorg/clobbered/issues/14)
         match engine.add_order(eth_order) {
             Err(ExecutionError::UnknownSymbol(symbol)) => assert_eq!(symbol, eth_symbol),
             _ => panic!("Expected UnknownSymbol error"),

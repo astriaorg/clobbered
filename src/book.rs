@@ -618,7 +618,7 @@ impl Book {
         mut order: order::Order,
         log: &mut transaction::Log,
     ) -> Result<(), AddOrderError> {
-        debug_assert_eq!(self.symbol, *order.symbol());
+        debug_assert_eq!(&self.symbol, order.symbol());
         
         if self.contains(order.id()) {
             return Err(AddOrderError::IdAlreadyExists(order));
@@ -969,10 +969,14 @@ mod tests {
         transaction::{self, Event, Fill, Log},
     };
 
+    fn symbol_btcusd() -> Symbol {
+        Symbol::try_from_str("BTCUSD").unwrap()
+    }
+
     fn order() -> Order {
         Order::builder()
             .id(Id::new(Uuid::new_v4()))
-            .symbol(Symbol::new("BTCUSD").unwrap())
+            .symbol(symbol_btcusd())
             .quantity(Quantity::new(10))
             .price(Price::new(5))
             .side(Side::Ask)
@@ -981,7 +985,7 @@ mod tests {
     }
 
     fn book() -> Book {
-        Book::new(Symbol::new("BTCUSD").unwrap())
+        Book::new(symbol_btcusd())
     }
 
     #[test]
