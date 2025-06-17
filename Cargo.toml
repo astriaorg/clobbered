@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 thiserror = "2.0.12"
+tinystr = "0.8.1"
 uuid = { version = "1.17.0", default-features = false, features = ["v6"] }
 
 [dev-dependencies]

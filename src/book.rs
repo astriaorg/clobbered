@@ -1,8 +1,4 @@
-use crate::{
-    level::Level,
-    order::{Side, Slippage},
-    transaction::Event,
-};
+use crate::{level::Level, order::Side, transaction::Event};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::{
@@ -575,6 +571,7 @@ where
 /// A price-time orderbook.
 #[derive(Debug)]
 pub struct Book {
+    symbol: order::Symbol,
     asks: Half<AskPrice>,
     bids: Half<BidPrice>,
 
@@ -593,8 +590,9 @@ pub struct Book {
 
 impl Book {
     /// Creates a new order book.
-    pub fn new() -> Self {
+    pub fn new(symbol: order::Symbol) -> Self {
         Self {
+            symbol,
             asks: Half::new(),
             bids: Half::new(),
             id_to_side_and_price: HashMap::new(),
@@ -620,6 +618,8 @@ impl Book {
         mut order: order::Order,
         log: &mut transaction::Log,
     ) -> Result<(), AddOrderError> {
+        debug_assert_eq!(&self.symbol, order.symbol());
+        
         if self.contains(order.id()) {
             return Err(AddOrderError::IdAlreadyExists(order));
         }
@@ -946,11 +946,6 @@ impl Book {
     }
 }
 
-impl Default for Book {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // utility to create a closure that is passed to the various matching functions to
 // remove orders in the higher-level id-to-side-and-price map (to avoid needing a
@@ -970,18 +965,27 @@ mod tests {
 
     use super::{AskPrice, BidPrice, Book, HasSide, PriceToLevel};
     use crate::{
-        order::{Id, Order, Price, Quantity, Side, Type},
+        order::{Id, Order, Price, Quantity, Side, Symbol, Type},
         transaction::{self, Event, Fill, Log},
     };
+
+    fn symbol_btcusd() -> Symbol {
+        Symbol::try_from_str("BTCUSD").unwrap()
+    }
 
     fn order() -> Order {
         Order::builder()
             .id(Id::new(Uuid::new_v4()))
+            .symbol(symbol_btcusd())
             .quantity(Quantity::new(10))
             .price(Price::new(5))
             .side(Side::Ask)
             .build()
             .unwrap()
+    }
+
+    fn book() -> Book {
+        Book::new(symbol_btcusd())
     }
 
     #[test]
@@ -1006,7 +1010,7 @@ mod tests {
         // scenario: the orderbook is empty, a limit order comes in
         //
         // expected result: the limit order is added to the book.
-        let mut book = Book::new();
+        let mut book = book();
         let id = Id::new(uuid::Uuid::new_v4());
         let price = Price::new(10);
         let side = Side::Bid;
@@ -1041,7 +1045,7 @@ mod tests {
         //
         // expected result: the market order is passed through and left
         // completely unfilled.
-        let mut book = Book::new();
+        let mut book = book();
         let id = Id::new(uuid::Uuid::new_v4());
         let side = Side::Bid;
         let type_ = Type::Market;
@@ -1079,7 +1083,7 @@ mod tests {
         //
         // expected result: the market order is partially filled at the price of the ask
         // order, the ask order limit order is completely filled.
-        let mut book = Book::new();
+        let mut book = book();
         let ask_id = Id::new(uuid::Uuid::new_v4());
         let ask_quantity = Quantity::new(9);
         let ask_price = Price::new(5);
@@ -1163,7 +1167,7 @@ mod tests {
         // expected result: the market order is completely filled. The ask order
         // at the lower price is completey filled. The ask order at the higher price
         // is partially filled.
-        let mut book = Book::new();
+        let mut book = book();
 
         let cheap_id = Id::new(uuid::Uuid::new_v4());
         let expensive_id = Id::new(uuid::Uuid::new_v4());
@@ -1243,7 +1247,7 @@ mod tests {
         // expected result: the stop order should be tracked by the book,
         // but it should not be considered as executable/affect the price
         // of its side.
-        let mut book = Book::new();
+        let mut book = book();
         let id = Id::new(uuid::Uuid::new_v4());
         let price = Price::new(10);
         let stop_price = Price::new(11);
@@ -1277,7 +1281,7 @@ mod tests {
         //
         // expected result: the stop limit order becomes a limit order on the book. both orders now
         // sit in the book. No matches between the two orders happen.
-        let mut book = Book::new();
+        let mut book = book();
         let id = Id::new(uuid::Uuid::new_v4());
         let mut log = Log::new();
         book.execute(
@@ -1326,7 +1330,7 @@ mod tests {
         // scenario: empty book, ask order comes in
         //
         // expected result: ask order does not cross the market (no bids to cross)
-        let book = Book::new();
+        let book = book();
         let ask_order = Order {
             side: Side::Ask,
             price: Price::new(100),
@@ -1340,7 +1344,7 @@ mod tests {
         // scenario: empty book, bid order comes in
         //
         // expected result: bid order does not cross the market (no asks to cross)
-        let book = Book::new();
+        let book = book();
         let bid_order = Order {
             side: Side::Bid,
             price: Price::new(100),
@@ -1354,7 +1358,7 @@ mod tests {
         // scenario: bid at 100 on book, ask order comes in at 90
         //
         // expected result: ask order crosses the market (ask price < bid price)
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
         book.execute(
             Order {
@@ -1379,7 +1383,7 @@ mod tests {
         // scenario: bid at 100 on book, ask order comes in at 100
         //
         // expected result: ask order crosses the market (ask price = bid price)
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
         book.execute(
             Order {
@@ -1404,7 +1408,7 @@ mod tests {
         // scenario: bid at 100 on book, ask order comes in at 110
         //
         // expected result: ask order should NOT cross (ask price > bid price)
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
         book.execute(
             Order {
@@ -1430,7 +1434,7 @@ mod tests {
         // scenario: ask at 100 on book, bid order comes in at 110
         //
         // expected result: bid order crosses the market (bid price > ask price)
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
         book.execute(
             Order {
@@ -1455,7 +1459,7 @@ mod tests {
         // scenario: ask at 100 on book, bid order comes in at 100
         //
         // expected result: bid order crosses the market (bid price = ask price)
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
         book.execute(
             Order {
@@ -1480,7 +1484,7 @@ mod tests {
         // scenario: ask at 100 on book, bid order comes in at 90
         //
         // expected result: bid order should NOT cross (bid price < ask price)
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
         book.execute(
             Order {
@@ -1506,7 +1510,7 @@ mod tests {
         // scenario: multiple bids on book (90, 95, 100), ask order comes in at 92
         //
         // expected result: ask order crosses the market (crosses the best bid at 100)
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
 
         // Add multiple bids
@@ -1551,7 +1555,7 @@ mod tests {
         // scenario: multiple asks on book (100, 105, 110), bid order comes in at 108
         //
         // expected result: bid order crosses the market (crosses the best ask at 100)
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
 
         // Add multiple asks
@@ -1598,7 +1602,7 @@ mod tests {
         // expected result: the operation returns the the order was cancelled.
         // A cancellation event is found in the log. A subsequent cancel returns
         // that no order was cancelled.
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
 
         let order_id = Id::new(uuid::Uuid::new_v4());
@@ -1629,7 +1633,7 @@ mod tests {
         // scenario: attempt to cancel an order that was never added to the book
         //
         // expected result: cancel returns false and no events are logged
-        let mut book = Book::new();
+        let mut book = book();
         let mut log = Log::new();
         let nonexistent_id = Id::new(uuid::Uuid::new_v4());
 

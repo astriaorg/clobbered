@@ -1,8 +1,35 @@
 #[derive(Debug, PartialEq, Eq)]
-pub enum Error {
+pub struct Error(ErrorKind);
+
+impl Error {
+    fn invalid_symbol(err: tinystr::ParseError) -> Self {
+        Self(ErrorKind::InvalidSymbol(err))
+    }
+
+    fn no_price() -> Self {
+        Self(ErrorKind::NoPrice)
+    }
+
+    fn no_side() -> Self {
+        Self(ErrorKind::NoSide)
+    }
+
+    fn no_stop_price() -> Self {
+        Self(ErrorKind::NoStopPrice)
+    }
+
+    fn no_symbol() -> Self {
+        Self(ErrorKind::NoSymbol)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ErrorKind {
+    InvalidSymbol(tinystr::ParseError),
     NoPrice,
     NoSide,
     NoStopPrice,
+    NoSymbol,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -11,6 +38,24 @@ pub struct Id(uuid::Uuid);
 impl Id {
     pub fn new(uuid: uuid::Uuid) -> Self {
         Self(uuid)
+    }
+}
+
+/// A trading symbol (up to 8 ASCII characters).
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Symbol(tinystr::TinyAsciiStr<8>);
+
+impl Symbol {
+    /// Creates a new symbol from a string slice.
+    pub fn try_from_str(s: &str) -> Result<Self, Error> {
+        let tiny_str = tinystr::TinyAsciiStr::try_from_str(s).map_err(Error::invalid_symbol)?;
+        Ok(Self(tiny_str))
+    }
+
+    /// Returns the symbol as a string slice.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
@@ -218,6 +263,7 @@ pub enum TimeInForce {
 
 pub struct Builder {
     id: Id,
+    symbol: Option<Symbol>,
     type_: Type,
     time_in_force: TimeInForce,
     side: Option<Side>,
@@ -232,6 +278,7 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             id: Id::new(uuid::Uuid::nil()),
+            symbol: None,
             type_: Type::Limit,
             time_in_force: TimeInForce::GoodTillCanceled,
             side: None,
@@ -245,6 +292,10 @@ impl Builder {
 
     pub fn id(self, id: Id) -> Self {
         Self { id, ..self }
+    }
+
+    pub fn symbol(self, symbol: Symbol) -> Self {
+        Self { symbol: Some(symbol), ..self }
     }
 
     pub fn type_(self, type_: Type) -> Self {
@@ -297,6 +348,7 @@ impl Builder {
     pub fn build(self) -> Result<Order, Error> {
         let Self {
             id,
+            symbol,
             type_,
             time_in_force,
             side,
@@ -306,8 +358,9 @@ impl Builder {
             slippage,
             post_only,
         } = self;
-        let side = side.ok_or(Error::NoSide)?;
-        let price = price.ok_or(Error::NoPrice)?;
+        let symbol = symbol.ok_or_else(Error::no_symbol)?;
+        let side = side.ok_or_else(Error::no_side)?;
+        let price = price.ok_or_else(Error::no_price)?;
 
         // XXX: For stop orders The stop price must be set. Otherwise the value itself
         // doesn't matter and is just passed through (the orderbook will not look at it).
@@ -319,10 +372,11 @@ impl Builder {
                     Some(Price::zero())
                 }
             })
-            .ok_or(Error::NoStopPrice)?;
+            .ok_or_else(Error::no_stop_price)?;
 
         Ok(Order {
             id,
+            symbol,
             type_,
             time_in_force,
             side,
@@ -340,6 +394,8 @@ impl Builder {
 pub struct Order {
     /// The ID assigned to the order upon entering the system.
     pub(crate) id: Id,
+    // The trading symbol for this order
+    pub(crate) symbol: Symbol,
     // The type of order (market, limit, etc)
     //
     // NOTE: type is a reserved keyword in rust, hence we call this field type_.
@@ -381,6 +437,10 @@ impl Order {
 
     pub fn id(&self) -> &Id {
         &self.id
+    }
+
+    pub fn symbol(&self) -> &Symbol {
+        &self.symbol
     }
 
     pub fn price(&self) -> &Price {
@@ -495,29 +555,36 @@ impl Order {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Order, Price, Side, Type};
+    use super::{Error, Order, Price, Side, Symbol, Type};
 
     #[test]
     fn orders_must_have_a_side_set() {
         assert_eq!(
-            Err(Error::NoSide),
-            Order::builder().price(Price::new(5)).build(),
+            Err(Error::no_side()),
+            Order::builder()
+                .symbol(Symbol::try_from_str("BTCUSD").unwrap())
+                .price(Price::new(5))
+                .build(),
         );
     }
 
     #[test]
     fn orders_must_have_a_price_set() {
         assert_eq!(
-            Err(Error::NoPrice),
-            Order::builder().side(Side::Ask).build(),
+            Err(Error::no_price()),
+            Order::builder()
+                .symbol(Symbol::try_from_str("BTCUSD").unwrap())
+                .side(Side::Ask)
+                .build(),
         );
     }
 
     #[test]
     fn stop_orders_must_have_stop_price_set() {
         assert_eq!(
-            Err(Error::NoStopPrice),
+            Err(Error::no_stop_price()),
             Order::builder()
+                .symbol(Symbol::try_from_str("BTCUSD").unwrap())
                 .type_(Type::Stop)
                 .price(Price::new(5))
                 .side(Side::Ask)
