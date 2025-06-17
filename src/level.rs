@@ -271,10 +271,11 @@ impl<'level> Iterator for OrdersMut<'level> {
 #[cfg(test)]
 mod tests {
     use super::Level;
-    use crate::order::{Id, Order, Price, Quantity, Side};
+    use crate::order::{Id, Order, Price, Quantity, Side, Symbol};
 
     fn order() -> Order {
         Order::builder()
+            .symbol(Symbol::new("BTCUSD").unwrap())
             .quantity(Quantity::new(10))
             .price(Price::new(5))
             .side(Side::Ask)
