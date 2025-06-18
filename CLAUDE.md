@@ -40,17 +40,19 @@ This is a synchronous order book implementation in Rust called "clobbered" - del
   - Implements price-time priority with BTreeMap for price levels
 
 - **Order** (`src/order.rs`): Order types and primitives
-  - Defines `Price`, `Quantity`, `Side` (Ask/Bid), and order `Type` enums
-  - Orders have IDs, prices, quantities, sides, and types
+  - Defines `Symbol`, `Price`, `Quantity`, `Side` (Ask/Bid), and order `Type` enums
+  - Orders have IDs, symbols, prices, quantities, sides, and types
   - Stop orders have both price and stop_price fields
+  - Symbol type uses `TinyAsciiStr<8>` for heap-allocation-free trading symbols
 
 - **Level** (`src/level.rs`): Price level management within the book
   - Each price level maintains a time-ordered list of orders
   - Handles order insertion, matching, and removal at a price level
 
 - **Engine** (`src/engine.rs`): Match engine wrapper
-  - Currently supports only one orderbook (no multi-symbol support yet)
-  - Provides higher-level interface for order execution
+  - Supports multiple orderbooks with one orderbook per trading symbol
+  - Uses HashMap<Symbol, Book> for efficient symbol-to-orderbook mapping
+  - Provides higher-level interface for order execution with symbol validation
 
 - **Transaction** (`src/transaction.rs`): Event logging and transaction records
   - Tracks all events: Add, Cancel, Match, Fill, Activate
@@ -65,7 +67,6 @@ This is a synchronous order book implementation in Rust called "clobbered" - del
 
 ### Current Limitations
 
-- Single orderbook only (no multi-symbol support)
 - Missing order types: trailing-stop, market-to-limit, pegged, iceberg
 - Missing time-in-force: good-till-date
 
